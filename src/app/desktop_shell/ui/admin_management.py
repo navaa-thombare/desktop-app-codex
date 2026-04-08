@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QSortFilterProxyModel, Qt
 from PySide6.QtWidgets import (
@@ -19,6 +20,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from app.platform.audit import AuditActor, AuditEventType, AuditQuery, AuditReviewService, AuditService
+from app.platform.logging.context import ensure_correlation_id
 
 
 @dataclass(slots=True)
@@ -199,6 +203,93 @@ class ManagementGridScreen(QWidget):
         self._refresh_status()
 
 
+class AuditReviewScreen(QWidget):
+    def __init__(self, review_service: AuditReviewService, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._review_service = review_service
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
+
+        heading = QLabel("Audit Review")
+        heading.setStyleSheet("font-size: 18px; font-weight: 600;")
+        subheading = QLabel(
+            "Investigate login/admin/permission events with event type, actor, and correlation filters."
+        )
+        subheading.setStyleSheet("color: #555;")
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Event Type"))
+        self.event_type_combo = QComboBox()
+        self.event_type_combo.addItems(
+            ["All", *[event_type.value for event_type in AuditEventType]]
+        )
+        controls.addWidget(self.event_type_combo)
+
+        controls.addWidget(QLabel("Actor"))
+        self.actor_input = QLineEdit()
+        self.actor_input.setPlaceholderText("user id (optional)")
+        controls.addWidget(self.actor_input)
+
+        controls.addWidget(QLabel("Correlation ID"))
+        self.correlation_input = QLineEdit()
+        self.correlation_input.setPlaceholderText("trace a full workflow")
+        controls.addWidget(self.correlation_input)
+
+        self.refresh_button = QPushButton("Run Query")
+        controls.addWidget(self.refresh_button)
+
+        self.model = _AdminTableModel(
+            headers=["Occurred", "Type", "Actor", "Correlation", "Payload Summary"],
+            rows=[],
+            parent=self,
+        )
+        self.table = QTableView()
+        self.table.setModel(self.model)
+        self.table.setSortingEnabled(True)
+        self.table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+        self.table.horizontalHeader().setStretchLastSection(True)
+
+        self.strategy_label = QLabel(
+            "Query strategy: filter by event type first, then actor, then correlation ID for precise incident timelines."
+        )
+        self.strategy_label.setWordWrap(True)
+        self.strategy_label.setStyleSheet("color: #555;")
+
+        root.addWidget(heading)
+        root.addWidget(subheading)
+        root.addLayout(controls)
+        root.addWidget(self.table)
+        root.addWidget(self.strategy_label)
+
+        self.refresh_button.clicked.connect(self._refresh)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        selected = self.event_type_combo.currentText()
+        event_type = None if selected == "All" else AuditEventType(selected)
+        actor_id = self.actor_input.text().strip() or None
+        correlation_id = self.correlation_input.text().strip() or None
+        rows = self._review_service.query(
+            AuditQuery(
+                event_type=event_type,
+                actor_id=actor_id,
+                correlation_id=correlation_id,
+                limit=200,
+            )
+        )
+        self.model = _AdminTableModel(
+            headers=["Occurred", "Type", "Actor", "Correlation", "Payload Summary"],
+            rows=[
+                (r.occurred_at, r.event_type, r.actor_id, r.correlation_id, r.summary)
+                for r in rows
+            ],
+            parent=self,
+        )
+        self.table.setModel(self.model)
+
+
 class AssignmentDialog(QDialog):
     def __init__(
         self,
@@ -208,9 +299,11 @@ class AssignmentDialog(QDialog):
         target_label: str,
         source_items: list[str],
         target_items: list[str],
+        on_assignment_change: Callable[[str, str], None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self._on_assignment_change = on_assignment_change
         self.setWindowTitle(title)
         self.setMinimumSize(760, 420)
 
@@ -259,34 +352,43 @@ class AssignmentDialog(QDialog):
         current = self.available_list.currentItem()
         if current is None:
             return
-        self._move_item(current, self.available_list, self.assigned_list)
+        self._move_item(current, self.available_list, self.assigned_list, "assign")
 
     def _unassign_selected(self) -> None:
         current = self.assigned_list.currentItem()
         if current is None:
             return
-        self._move_item(current, self.assigned_list, self.available_list)
+        self._move_item(current, self.assigned_list, self.available_list, "unassign")
 
-    def _move_item(self, item: QListWidgetItem, origin: QListWidget, destination: QListWidget) -> None:
+    def _move_item(
+        self,
+        item: QListWidgetItem,
+        origin: QListWidget,
+        destination: QListWidget,
+        action: str,
+    ) -> None:
         text = item.text()
         origin.takeItem(origin.row(item))
         destination.addItem(text)
+        if self._on_assignment_change:
+            self._on_assignment_change(action, text)
 
 
 class UserRoleAssignmentDialog(AssignmentDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, on_assignment_change: Callable[[str, str], None] | None = None, parent: QWidget | None = None) -> None:
         super().__init__(
             title="Assign Roles to User",
             source_label="Available roles",
             target_label="User roles",
             source_items=["Billing Analyst", "Support Agent", "Audit Reader", "Security Officer"],
             target_items=["System Admin"],
+            on_assignment_change=on_assignment_change,
             parent=parent,
         )
 
 
 class RolePermissionAssignmentDialog(AssignmentDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, on_assignment_change: Callable[[str, str], None] | None = None, parent: QWidget | None = None) -> None:
         super().__init__(
             title="Assign Permissions to Role",
             source_label="Available permissions",
@@ -299,19 +401,29 @@ class RolePermissionAssignmentDialog(AssignmentDialog):
                 "billing:refund",
             ],
             target_items=["user:view", "user:edit", "permission:view"],
+            on_assignment_change=on_assignment_change,
             parent=parent,
         )
 
 
 class AccessControlWorkspace(QDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        current_user_id: str | None,
+        audit_service: AuditService,
+        audit_review_service: AuditReviewService,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
+        self._current_user_id = current_user_id
+        self._audit_service = audit_service
         self.setWindowTitle("Access Control Management")
         self.resize(980, 640)
 
         root = QVBoxLayout(self)
         intro = QLabel(
-            "Manage users, roles, and permissions with searchable and sortable grids."
+            "Manage users, roles, permissions, and review immutable audit events."
         )
         intro.setStyleSheet("color: #555;")
 
@@ -319,6 +431,7 @@ class AccessControlWorkspace(QDialog):
         self.tabs.addTab(self._build_user_screen(), "Users")
         self.tabs.addTab(self._build_role_screen(), "Roles")
         self.tabs.addTab(self._build_permission_screen(), "Permissions")
+        self.tabs.addTab(AuditReviewScreen(audit_review_service), "Audit")
 
         actions = QHBoxLayout()
         self.user_assignment_button = QPushButton("Assign Roles to Selected User")
@@ -397,10 +510,31 @@ class AccessControlWorkspace(QDialog):
             filter_options=["Low", "Medium", "High", "Critical"],
         )
 
+    def _record_admin_change(self, action: str, value: str) -> None:
+        correlation_id = ensure_correlation_id()
+        self._audit_service.publish(
+            event_type=AuditEventType.ADMIN_CHANGE,
+            correlation_id=correlation_id,
+            actor=AuditActor(actor_id=self._current_user_id),
+            payload={"action": action, "target_type": "role_assignment", "value": value},
+        )
+
+    def _record_permission_change(self, action: str, value: str) -> None:
+        correlation_id = ensure_correlation_id()
+        self._audit_service.publish(
+            event_type=AuditEventType.PERMISSION_CHANGE,
+            correlation_id=correlation_id,
+            actor=AuditActor(actor_id=self._current_user_id),
+            payload={"action": action, "target_type": "permission_assignment", "value": value},
+        )
+
     def _open_user_assignment(self) -> None:
-        dialog = UserRoleAssignmentDialog(self)
+        dialog = UserRoleAssignmentDialog(on_assignment_change=self._record_admin_change, parent=self)
         dialog.exec()
 
     def _open_role_assignment(self) -> None:
-        dialog = RolePermissionAssignmentDialog(self)
+        dialog = RolePermissionAssignmentDialog(
+            on_assignment_change=self._record_permission_change,
+            parent=self,
+        )
         dialog.exec()

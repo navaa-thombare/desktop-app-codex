@@ -16,6 +16,7 @@ class LoginRequest:
     password: str
     ip_address: str | None = None
     user_agent: str | None = None
+    correlation_id: str | None = None
 
 
 @dataclass(frozen=True)

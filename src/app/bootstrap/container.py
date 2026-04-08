@@ -20,6 +20,8 @@ from app.authorization.services import (
     EffectivePermissionService,
     ReportingService,
 )
+from app.platform.audit.in_memory import InMemoryAuditEventRepository
+from app.platform.audit.services import AuditReviewService, AuditService
 from app.platform.config.settings import AppSettings
 from app.platform.db.session import build_engine, build_session_factory
 
@@ -35,6 +37,8 @@ class Container:
     authorization_service: AuthorizationService
     authorization_guard: AuthorizationGuard
     reporting_service: ReportingService
+    audit_service: AuditService
+    audit_review_service: AuditReviewService
 
 
 def build_container(settings: AppSettings) -> Container:
@@ -55,10 +59,15 @@ def build_container(settings: AppSettings) -> Container:
             )
         ]
     )
+    audit_repository = InMemoryAuditEventRepository()
+    audit_service = AuditService(repository=audit_repository)
+    audit_review_service = AuditReviewService(repository=audit_repository)
+
     auth_service = AuthService(
         user_repository=user_repository,
         session_repository=InMemorySessionRepository(),
         password_verifier=Sha256PasswordVerifier(pepper=demo_pepper),
+        audit_service=audit_service,
     )
 
     role_repository = InMemoryRoleRepository(
@@ -105,4 +114,6 @@ def build_container(settings: AppSettings) -> Container:
         authorization_service=authorization_service,
         authorization_guard=authorization_guard,
         reporting_service=reporting_service,
+        audit_service=audit_service,
+        audit_review_service=audit_review_service,
     )

@@ -23,6 +23,7 @@ from app.authorization.services import (
     AuthorizationService,
     ReportingService,
 )
+from app.desktop_shell.ui.admin_management import AccessControlWorkspace
 
 
 class MainWindow(QMainWindow):
@@ -221,6 +222,10 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Report", report_status)
 
     def _navigate(self, destination: str) -> None:
+        if destination == "Admin Console":
+            AccessControlWorkspace(self).exec()
+            return
+
         QMessageBox.information(self, "Navigation", f"Navigated to {destination}.")
 
     def _set_loading(self, is_loading: bool) -> None:

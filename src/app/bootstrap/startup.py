@@ -39,6 +39,8 @@ def start_application(settings: AppSettings | None = None) -> int:
         container.authorization_service,
         container.authorization_guard,
         container.reporting_service,
+        container.audit_service,
+        container.audit_review_service,
     )
     window.show()
     return qt_app.exec()

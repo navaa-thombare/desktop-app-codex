@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timezone
+from uuid import uuid4
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
@@ -24,6 +25,7 @@ from app.authorization.services import (
     ReportingService,
 )
 from app.desktop_shell.ui.admin_management import AccessControlWorkspace
+from app.platform.audit import AuditReviewService, AuditService
 
 
 class MainWindow(QMainWindow):
@@ -34,12 +36,16 @@ class MainWindow(QMainWindow):
         authorization_service: AuthorizationService,
         authorization_guard: AuthorizationGuard,
         reporting_service: ReportingService,
+        audit_service: AuditService,
+        audit_review_service: AuditReviewService,
     ) -> None:
         super().__init__()
         self._auth_service = auth_service
         self._authorization_service = authorization_service
         self._authorization_guard = authorization_guard
         self._reporting_service = reporting_service
+        self._audit_service = audit_service
+        self._audit_review_service = audit_review_service
         self._current_user_id: str | None = None
         self._is_loading = False
 
@@ -145,6 +151,7 @@ class MainWindow(QMainWindow):
                 identifier=identifier,
                 password=password,
                 user_agent="desktop-app/qt",
+                correlation_id=str(uuid4()),
             )
         )
 
@@ -223,7 +230,12 @@ class MainWindow(QMainWindow):
 
     def _navigate(self, destination: str) -> None:
         if destination == "Admin Console":
-            AccessControlWorkspace(self).exec()
+            AccessControlWorkspace(
+                current_user_id=self._current_user_id,
+                audit_service=self._audit_service,
+                audit_review_service=self._audit_review_service,
+                parent=self,
+            ).exec()
             return
 
         QMessageBox.information(self, "Navigation", f"Navigated to {destination}.")

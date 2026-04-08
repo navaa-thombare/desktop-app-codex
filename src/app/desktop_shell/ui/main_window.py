@@ -17,12 +17,29 @@ from PySide6.QtWidgets import (
 
 from app.auth.dtos import AuthFailureCode, LoginRequest
 from app.auth.services import AuthService
+from app.authorization.services import (
+    AuthorizationDeniedError,
+    AuthorizationGuard,
+    AuthorizationService,
+    ReportingService,
+)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, app_name: str, auth_service: AuthService) -> None:
+    def __init__(
+        self,
+        app_name: str,
+        auth_service: AuthService,
+        authorization_service: AuthorizationService,
+        authorization_guard: AuthorizationGuard,
+        reporting_service: ReportingService,
+    ) -> None:
         super().__init__()
         self._auth_service = auth_service
+        self._authorization_service = authorization_service
+        self._authorization_guard = authorization_guard
+        self._reporting_service = reporting_service
+        self._current_user_id: str | None = None
         self._is_loading = False
 
         self.setWindowTitle(f"{app_name} • Login")
@@ -69,11 +86,39 @@ class MainWindow(QMainWindow):
         actions.addStretch(1)
         actions.addWidget(self.reset_button)
 
+        self.nav_label = QLabel("Authorized Navigation")
+        self.nav_label.setStyleSheet("font-size: 16px; font-weight: 600;")
+        self.nav_label.hide()
+
+        nav_row = QHBoxLayout()
+        self.nav_home_button = QPushButton("Home")
+        self.nav_admin_button = QPushButton("Admin Console")
+        self.nav_billing_button = QPushButton("Billing")
+
+        nav_row.addWidget(self.nav_home_button)
+        nav_row.addWidget(self.nav_admin_button)
+        nav_row.addWidget(self.nav_billing_button)
+
+        self.nav_home_button.clicked.connect(lambda: self._navigate("Home"))
+        self.nav_admin_button.clicked.connect(lambda: self._navigate("Admin Console"))
+        self.nav_billing_button.clicked.connect(lambda: self._navigate("Billing"))
+
+        self.report_button = QPushButton("Run Operational Report")
+        self.report_button.clicked.connect(self._run_operational_report)
+        self.report_button.hide()
+
         layout.addWidget(heading)
         layout.addWidget(subheading)
         layout.addLayout(form)
         layout.addWidget(self.validation_label)
         layout.addLayout(actions)
+        layout.addWidget(self.nav_label)
+        layout.addLayout(nav_row)
+        layout.addWidget(self.report_button)
+
+        self.nav_home_button.hide()
+        self.nav_admin_button.hide()
+        self.nav_billing_button.hide()
 
         self.setCentralWidget(root)
 
@@ -106,6 +151,7 @@ class MainWindow(QMainWindow):
 
         if result.success and result.session:
             self.password_input.clear()
+            self._current_user_id = result.session.user_id
             self.validation_label.setStyleSheet("color: #1b5e20;")
             success_message = "Login successful. Your secure session is now active."
             if result.password_reset_required:
@@ -118,6 +164,7 @@ class MainWindow(QMainWindow):
                 "Welcome",
                 f"Authenticated successfully. Session expires at {expiry}.",
             )
+            self._render_authorized_navigation()
             self.validation_label.setStyleSheet("color: #b00020;")
             return
 
@@ -130,6 +177,51 @@ class MainWindow(QMainWindow):
             return
 
         self.validation_label.setText("Unable to sign in with those credentials.")
+
+    def _render_authorized_navigation(self) -> None:
+        if self._current_user_id is None:
+            return
+
+        self.nav_label.show()
+        self.nav_home_button.show()
+        self.nav_admin_button.show()
+        self.nav_billing_button.show()
+        self.report_button.show()
+
+        context = self._authorization_service.build_context(self._current_user_id)
+        nav_checks = {
+            self.nav_home_button: "nav:home",
+            self.nav_admin_button: "nav:admin",
+            self.nav_billing_button: "nav:billing",
+        }
+
+        for button, permission in nav_checks.items():
+            is_allowed = self._authorization_guard.can(permission=permission, context=context)
+            button.setEnabled(is_allowed)
+            button.setToolTip("" if is_allowed else f"Access denied by default for {permission}")
+
+        report_allowed = self._authorization_guard.can(permission="report:run", context=context)
+        self.report_button.setEnabled(report_allowed)
+        self.report_button.setToolTip(
+            "" if report_allowed else "Access denied by default for report:run"
+        )
+
+    def _run_operational_report(self) -> None:
+        if self._current_user_id is None:
+            return
+
+        try:
+            report_status = self._reporting_service.run_operational_report(
+                user_id=self._current_user_id
+            )
+        except AuthorizationDeniedError as exc:
+            QMessageBox.warning(self, "Authorization Denied", str(exc))
+            return
+
+        QMessageBox.information(self, "Report", report_status)
+
+    def _navigate(self, destination: str) -> None:
+        QMessageBox.information(self, "Navigation", f"Navigated to {destination}.")
 
     def _set_loading(self, is_loading: bool) -> None:
         self._is_loading = is_loading

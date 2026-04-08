@@ -27,3 +27,12 @@ pip install -e .[dev]
 cp .env.example .env
 python -m app.main
 ```
+
+## Authorization model
+
+The scaffold includes a role-based authorization layer with explicit `allow` and `deny` grants.
+Effective permissions are computed per user context, with explicit denies taking precedence and a deny-by-default fallback for any permission not granted.
+
+This deny-by-default model is applied in two places:
+- UI navigation: disabled nav actions for unauthorized destinations.
+- Service execution: guarded service methods raise `AuthorizationDeniedError` when permission is missing.

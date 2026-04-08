@@ -33,6 +33,12 @@ def start_application(settings: AppSettings | None = None) -> int:
     logger.debug("Container initialized with DB URL %s", container.settings.db_url)
 
     qt_app = QApplication(sys.argv)
-    window = MainWindow(container.settings.app_name, container.auth_service)
+    window = MainWindow(
+        container.settings.app_name,
+        container.auth_service,
+        container.authorization_service,
+        container.authorization_guard,
+        container.reporting_service,
+    )
     window.show()
     return qt_app.exec()

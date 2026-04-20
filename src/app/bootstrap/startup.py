@@ -41,6 +41,8 @@ def start_application(settings: AppSettings | None = None) -> int:
         container.reporting_service,
         container.audit_service,
         container.audit_review_service,
+        container.admin_user_management_service,
+        app_env=container.settings.app_env,
     )
     window.show()
     return qt_app.exec()

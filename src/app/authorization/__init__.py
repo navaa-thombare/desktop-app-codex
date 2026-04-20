@@ -6,6 +6,10 @@ from app.authorization.dtos import (
     RoleRecord,
 )
 from app.authorization.in_memory import InMemoryRoleRepository, InMemoryUserRoleRepository
+from app.authorization.managed import (
+    ManagedAuthorizationRoleRepository,
+    ManagedAuthorizationUserRoleRepository,
+)
 from app.authorization.services import (
     AuthorizationDeniedError,
     AuthorizationGuard,
@@ -23,6 +27,8 @@ __all__ = [
     "EffectivePermissions",
     "InMemoryRoleRepository",
     "InMemoryUserRoleRepository",
+    "ManagedAuthorizationRoleRepository",
+    "ManagedAuthorizationUserRoleRepository",
     "PermissionEffect",
     "PermissionGrant",
     "ReportingService",

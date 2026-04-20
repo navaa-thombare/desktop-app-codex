@@ -17,6 +17,9 @@ class PasswordVerifier(Protocol):
     def verify(self, password_hash: str, plain_password: str) -> bool:
         ...
 
+    def hash(self, plain_password: str) -> str:
+        ...
+
 
 class PasswordResetHook(Protocol):
     def on_password_reset_required(self, user_id: str) -> None:
@@ -43,6 +46,9 @@ class Argon2idPasswordVerifier:
             return bool(self._hasher.verify(password_hash, plain_password))
         except self._verify_mismatch_error:
             return False
+
+    def hash(self, plain_password: str) -> str:
+        return str(self._hasher.hash(plain_password))
 
 
 @dataclass
@@ -116,6 +122,70 @@ class AuthService:
             password_reset_required=user.password_reset_required,
         )
 
+    def begin_password_recovery(
+        self,
+        *,
+        identifier: str,
+        recovery_contact: str,
+        correlation_id: str | None = None,
+    ) -> "PasswordRecoveryResult":
+        normalized_identifier = identifier.strip()
+        normalized_contact = recovery_contact.strip()
+        if not normalized_identifier or not normalized_contact:
+            raise ValueError("Enter the identifier and one registered contact value.")
+
+        correlation = ensure_correlation_id(correlation_id)
+        user = self._resolve_user(normalized_identifier)
+        if user is None or not self.user_repository.matches_recovery_contact(
+            user_id=user.user_id,
+            recovery_contact=normalized_contact,
+        ):
+            self._publish_password_recovery_event(
+                correlation_id=correlation,
+                actor_id=user.user_id if user else None,
+                identifier=normalized_identifier,
+                recovery_contact=normalized_contact,
+                success=False,
+            )
+            return PasswordRecoveryResult(success=False)
+
+        self._publish_password_recovery_event(
+            correlation_id=correlation,
+            actor_id=user.user_id,
+            identifier=normalized_identifier,
+            recovery_contact=normalized_contact,
+            success=True,
+        )
+        return PasswordRecoveryResult(
+            success=True,
+            user_id=user.user_id,
+            username=user.username,
+        )
+
+    def reset_password(self, *, user_id: str, new_password: str) -> None:
+        user = self.user_repository.get_by_user_id(user_id)
+        if user is None:
+            raise ValueError("Unknown user account.")
+
+        candidate = new_password.strip()
+        self._validate_password(candidate)
+        if self.password_verifier.verify(user.password_hash, candidate):
+            raise ValueError("New password must be different from the current temporary password.")
+
+        self.user_repository.update_password(
+            user_id=user_id,
+            password_hash=self.password_verifier.hash(candidate),
+            password_reset_required=False,
+        )
+
+        if self.audit_service is not None:
+            self.audit_service.publish(
+                event_type=AuditEventType.ADMIN_CHANGE,
+                correlation_id=ensure_correlation_id(),
+                actor=AuditActor(actor_id=user_id),
+                payload={"action": "reset_password", "target_type": "auth_user", "value": user_id},
+            )
+
     def _resolve_user(self, identifier: str) -> UserRecord | None:
         username_match = self.user_repository.get_by_username(identifier)
         if username_match:
@@ -172,9 +242,8 @@ class AuthService:
         request: LoginRequest,
         details: dict[str, object],
     ) -> None:
-        masked_identifier = request.identifier[:2] + "***" if len(request.identifier) > 2 else "***"
         payload = {
-            "identifier_masked": masked_identifier,
+            "identifier_masked": self._mask_value(request.identifier),
             "ip_address": request.ip_address,
             "user_agent": request.user_agent,
             **details,
@@ -195,3 +264,52 @@ class AuthService:
                 actor=AuditActor(actor_id=actor_id),
                 payload=payload,
             )
+
+    def _publish_password_recovery_event(
+        self,
+        *,
+        correlation_id: str,
+        actor_id: str | None,
+        identifier: str,
+        recovery_contact: str,
+        success: bool,
+    ) -> None:
+        if self.audit_service is None:
+            return
+
+        self.audit_service.publish(
+            event_type=AuditEventType.ADMIN_CHANGE,
+            correlation_id=correlation_id,
+            actor=AuditActor(actor_id=actor_id),
+            payload={
+                "action": "password_recovery_verified" if success else "password_recovery_rejected",
+                "identifier_masked": self._mask_value(identifier),
+                "recovery_contact_masked": self._mask_value(recovery_contact),
+            },
+        )
+
+    def _validate_password(self, candidate: str) -> None:
+        if len(candidate) < 12:
+            raise ValueError("New password must be at least 12 characters long.")
+        if not any(character.isupper() for character in candidate):
+            raise ValueError("New password must contain at least one uppercase letter.")
+        if not any(character.islower() for character in candidate):
+            raise ValueError("New password must contain at least one lowercase letter.")
+        if not any(character.isdigit() for character in candidate):
+            raise ValueError("New password must contain at least one digit.")
+        if not any(not character.isalnum() for character in candidate):
+            raise ValueError("New password must contain at least one special character.")
+
+    @staticmethod
+    def _mask_value(value: str) -> str:
+        normalized = value.strip()
+        if len(normalized) <= 2:
+            return "***"
+        return normalized[:2] + "***"
+
+
+@dataclass(frozen=True)
+class PasswordRecoveryResult:
+    success: bool
+    user_id: str | None = None
+    username: str | None = None

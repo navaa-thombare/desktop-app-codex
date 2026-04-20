@@ -4,16 +4,17 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import sessionmaker
 
-from app.auth.dtos import UserRecord
+from app.admin.services import AdminUserManagementService
 from app.auth.in_memory import (
     InMemorySessionRepository,
-    InMemoryUserRepository,
     Sha256PasswordVerifier,
-    hash_password,
 )
+from app.auth.sqlalchemy import SqlUserRepository
 from app.auth.services import AuthService
-from app.authorization.dtos import PermissionEffect, PermissionGrant, RoleRecord
-from app.authorization.in_memory import InMemoryRoleRepository, InMemoryUserRoleRepository
+from app.authorization.managed import (
+    ManagedAuthorizationRoleRepository,
+    ManagedAuthorizationUserRoleRepository,
+)
 from app.authorization.services import (
     AuthorizationGuard,
     AuthorizationService,
@@ -39,6 +40,7 @@ class Container:
     reporting_service: ReportingService
     audit_service: AuditService
     audit_review_service: AuditReviewService
+    admin_user_management_service: AdminUserManagementService
 
 
 def build_container(settings: AppSettings) -> Container:
@@ -46,54 +48,28 @@ def build_container(settings: AppSettings) -> Container:
     session_factory = build_session_factory(engine)
 
     demo_pepper = "desktop-app-demo-pepper"
-    user_repository = InMemoryUserRepository(
-        users=[
-            UserRecord(
-                user_id="u-demo-1",
-                username="admin",
-                mobile="+15551230000",
-                password_hash=hash_password("ChangeMe123!", pepper=demo_pepper),
-                failed_attempts=0,
-                lockout_until=None,
-                password_reset_required=True,
-            )
-        ]
-    )
+    password_manager = Sha256PasswordVerifier(pepper=demo_pepper)
     audit_repository = InMemoryAuditEventRepository()
     audit_service = AuditService(repository=audit_repository)
     audit_review_service = AuditReviewService(repository=audit_repository)
+    admin_user_management_service = AdminUserManagementService(
+        engine=engine,
+        session_factory=session_factory,
+        password_hasher=password_manager.hash,
+        bootstrap_password="ChangeMe123!",
+    )
+    user_repository = SqlUserRepository(session_factory=session_factory)
 
     auth_service = AuthService(
         user_repository=user_repository,
         session_repository=InMemorySessionRepository(),
-        password_verifier=Sha256PasswordVerifier(pepper=demo_pepper),
+        password_verifier=password_manager,
         audit_service=audit_service,
     )
 
-    role_repository = InMemoryRoleRepository(
-        roles=[
-            RoleRecord(
-                role_id="role.admin",
-                name="Administrator",
-                grants=(
-                    PermissionGrant(permission="nav:home", effect=PermissionEffect.ALLOW),
-                    PermissionGrant(permission="nav:admin", effect=PermissionEffect.ALLOW),
-                    PermissionGrant(permission="report:run", effect=PermissionEffect.ALLOW),
-                ),
-            ),
-            RoleRecord(
-                role_id="role.billing-restricted",
-                name="Billing Restricted",
-                grants=(
-                    PermissionGrant(permission="nav:billing", effect=PermissionEffect.DENY),
-                ),
-            ),
-        ]
-    )
-    user_role_repository = InMemoryUserRoleRepository(
-        user_roles={
-            "u-demo-1": ("role.admin", "role.billing-restricted"),
-        }
+    role_repository = ManagedAuthorizationRoleRepository()
+    user_role_repository = ManagedAuthorizationUserRoleRepository(
+        user_management_service=admin_user_management_service,
     )
 
     authorization_service = AuthorizationService(
@@ -116,4 +92,5 @@ def build_container(settings: AppSettings) -> Container:
         reporting_service=reporting_service,
         audit_service=audit_service,
         audit_review_service=audit_review_service,
+        admin_user_management_service=admin_user_management_service,
     )

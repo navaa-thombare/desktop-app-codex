@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, func, select
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, func, inspect, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
@@ -21,6 +21,7 @@ class ManagedUserModel(Base):
     username: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     full_name: Mapped[str] = mapped_column(String(150), nullable=False)
     contact_info: Mapped[str] = mapped_column(String(200), nullable=False)
+    store_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
     created_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     roles: Mapped[list["ManagedUserRoleModel"]] = relationship(
@@ -72,9 +73,14 @@ class ManagedStoreModel(Base):
     store_id: Mapped[str] = mapped_column(String(50), primary_key=True)
     store_code: Mapped[str] = mapped_column(String(40), unique=True, nullable=False)
     store_name: Mapped[str] = mapped_column(String(150), nullable=False)
+    address: Mapped[str | None] = mapped_column(String(250), nullable=True)
     city: Mapped[str] = mapped_column(String(120), nullable=False)
     manager_name: Mapped[str] = mapped_column(String(150), nullable=False)
     contact_info: Mapped[str] = mapped_column(String(200), nullable=False)
+    owner_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    owner_mobile: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    owner_email: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    store_admin_user_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
     status: Mapped[str] = mapped_column(String(40), nullable=False)
     created_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -140,6 +146,8 @@ class AdminUserProfile:
     full_name: str
     username: str
     contact_info: str
+    store_id: str | None
+    store_name: str
     created_on: datetime
     roles: tuple[str, ...]
     permissions: tuple[str, ...]
@@ -151,12 +159,44 @@ class AdminStoreRecord:
     store_id: str
     store_code: str
     store_name: str
+    address: str
     city: str
     manager_name: str
     contact_info: str
+    owner_name: str
+    owner_mobile: str
+    owner_email: str
+    store_admin_user_id: str | None
+    store_admin_username: str
+    store_admin_full_name: str
+    store_admin_mobile: str
+    store_admin_email: str
     status: str
     created_on: datetime
     updated_on: datetime
+
+
+@dataclass(frozen=True)
+class StoreProvisionResult:
+    store_id: str
+    store_admin_user_id: str | None
+    store_admin_username: str | None
+    temporary_password: str | None = None
+
+
+@dataclass(frozen=True)
+class StoreDashboardContext:
+    store_id: str
+    store_code: str
+    store_name: str
+    address: str
+    city: str
+    contact_info: str
+    owner_name: str
+    owner_mobile: str
+    owner_email: str
+    status: str
+    user_count: int
 
 
 @dataclass(frozen=True)
@@ -293,17 +333,40 @@ class AdminUserManagementService:
         self._password_hasher = password_hasher
         self._bootstrap_password = bootstrap_password
         Base.metadata.create_all(bind=self._engine)
+        self._ensure_user_schema_columns()
+        self._ensure_store_schema_columns()
         self._seed_if_needed()
         self._ensure_default_hierarchy_users()
         self._ensure_role_definitions()
         self._ensure_store_catalog()
+        self._backfill_store_metadata()
+        self._backfill_store_user_assignments()
         self._ensure_auth_records()
 
-    def list_users(self) -> tuple[AdminUserSummary, ...]:
+    def list_users(
+        self,
+        *,
+        actor_user_id: str | None = None,
+        store_id: str | None = None,
+    ) -> tuple[AdminUserSummary, ...]:
+        scoped_store_id = self._resolve_store_scope(
+            actor_user_id=actor_user_id,
+            explicit_store_id=store_id,
+        )
+        actor_role = self.role_name_for_user(actor_user_id)
+        manageable_roles = set(self.available_roles_for_actor(actor_user_id))
         with self._session_factory() as session:
-            rows = session.scalars(
-                select(ManagedUserModel).order_by(ManagedUserModel.full_name.asc())
-            ).all()
+            statement = select(ManagedUserModel)
+            if scoped_store_id is not None and actor_role != "Superadmin":
+                statement = statement.where(ManagedUserModel.store_id == scoped_store_id)
+            rows = session.scalars(statement.order_by(ManagedUserModel.full_name.asc())).all()
+            if scoped_store_id is not None and actor_role != "Superadmin":
+                rows = [
+                    row
+                    for row in rows
+                    if row.user_id != actor_user_id
+                    and self._normalized_role_for_existing_user(row) in manageable_roles
+                ]
             return tuple(AdminUserSummary(user_id=row.user_id, full_name=row.full_name) for row in rows)
 
     def list_stores(self) -> tuple[AdminStoreRecord, ...]:
@@ -314,59 +377,59 @@ class AdminUserManagementService:
                     ManagedStoreModel.store_name.asc(),
                 )
             ).all()
-            return tuple(self._to_store_record(row) for row in rows)
+            return tuple(self._to_store_record(row, session=session) for row in rows)
 
     def get_store(self, store_id: str) -> AdminStoreRecord | None:
         with self._session_factory() as session:
             row = session.get(ManagedStoreModel, store_id)
             if row is None:
                 return None
-            return self._to_store_record(row)
+            return self._to_store_record(row, session=session)
 
     def create_store(
         self,
         *,
         store_code: str,
         store_name: str,
+        address: str,
         city: str,
         manager_name: str,
         contact_info: str,
         status: str,
     ) -> str:
-        normalized_store_code = store_code.strip().upper()
-        normalized_store_name = store_name.strip()
-        normalized_city = city.strip()
-        normalized_manager_name = manager_name.strip()
-        normalized_contact_info = contact_info.strip()
-        normalized_status = self._normalize_store_status(status)
-        if not normalized_store_code:
-            raise ValueError("Store code is required.")
-        if not normalized_store_name:
-            raise ValueError("Store name is required.")
-        if not normalized_city:
-            raise ValueError("City is required.")
-        if not normalized_manager_name:
-            raise ValueError("Manager name is required.")
-        if not normalized_contact_info:
-            raise ValueError("Contact information is required.")
+        normalized_store = self._normalize_store_fields(
+            store_code=store_code,
+            store_name=store_name,
+            address=address,
+            city=city,
+            manager_name=manager_name,
+            contact_info=contact_info,
+            status=status,
+        )
 
         with self._session_factory() as session:
             existing_store = session.scalar(
-                select(ManagedStoreModel).where(ManagedStoreModel.store_code == normalized_store_code)
+                select(ManagedStoreModel).where(
+                    ManagedStoreModel.store_code == normalized_store["store_code"]
+                )
             )
             if existing_store is not None:
-                raise ValueError(f"Store code '{normalized_store_code}' already exists.")
+                raise ValueError(f"Store code '{normalized_store['store_code']}' already exists.")
 
             now = datetime.now(tz=timezone.utc)
             store_id = f"store-{uuid4().hex[:8]}"
             store = ManagedStoreModel(
                 store_id=store_id,
-                store_code=normalized_store_code,
-                store_name=normalized_store_name,
-                city=normalized_city,
-                manager_name=normalized_manager_name,
-                contact_info=normalized_contact_info,
-                status=normalized_status,
+                store_code=normalized_store["store_code"],
+                store_name=normalized_store["store_name"],
+                address=normalized_store["address"],
+                city=normalized_store["city"],
+                manager_name=normalized_store["manager_name"],
+                contact_info=normalized_store["contact_info"],
+                owner_name=normalized_store["manager_name"],
+                owner_mobile=self._extract_mobile(normalized_store["contact_info"]),
+                owner_email=self._extract_email(normalized_store["contact_info"]),
+                status=normalized_store["status"],
                 created_on=now,
                 updated_on=now,
             )
@@ -380,27 +443,21 @@ class AdminUserManagementService:
         store_id: str,
         store_code: str,
         store_name: str,
+        address: str,
         city: str,
         manager_name: str,
         contact_info: str,
         status: str,
     ) -> None:
-        normalized_store_code = store_code.strip().upper()
-        normalized_store_name = store_name.strip()
-        normalized_city = city.strip()
-        normalized_manager_name = manager_name.strip()
-        normalized_contact_info = contact_info.strip()
-        normalized_status = self._normalize_store_status(status)
-        if not normalized_store_code:
-            raise ValueError("Store code is required.")
-        if not normalized_store_name:
-            raise ValueError("Store name is required.")
-        if not normalized_city:
-            raise ValueError("City is required.")
-        if not normalized_manager_name:
-            raise ValueError("Manager name is required.")
-        if not normalized_contact_info:
-            raise ValueError("Contact information is required.")
+        normalized_store = self._normalize_store_fields(
+            store_code=store_code,
+            store_name=store_name,
+            address=address,
+            city=city,
+            manager_name=manager_name,
+            contact_info=contact_info,
+            status=status,
+        )
 
         with self._session_factory() as session:
             store = session.get(ManagedStoreModel, store_id)
@@ -409,21 +466,301 @@ class AdminUserManagementService:
 
             duplicate_store = session.scalar(
                 select(ManagedStoreModel).where(
-                    ManagedStoreModel.store_code == normalized_store_code,
+                    ManagedStoreModel.store_code == normalized_store["store_code"],
                     ManagedStoreModel.store_id != store_id,
                 )
             )
             if duplicate_store is not None:
-                raise ValueError(f"Store code '{normalized_store_code}' already exists.")
+                raise ValueError(f"Store code '{normalized_store['store_code']}' already exists.")
 
-            store.store_code = normalized_store_code
-            store.store_name = normalized_store_name
-            store.city = normalized_city
-            store.manager_name = normalized_manager_name
-            store.contact_info = normalized_contact_info
-            store.status = normalized_status
+            store.store_code = normalized_store["store_code"]
+            store.store_name = normalized_store["store_name"]
+            store.address = normalized_store["address"]
+            store.city = normalized_store["city"]
+            store.manager_name = normalized_store["manager_name"]
+            store.contact_info = normalized_store["contact_info"]
+            store.status = normalized_store["status"]
+            if not store.owner_name:
+                store.owner_name = normalized_store["manager_name"]
+            if not store.owner_mobile:
+                store.owner_mobile = self._extract_mobile(normalized_store["contact_info"])
+            if not store.owner_email:
+                store.owner_email = self._extract_email(normalized_store["contact_info"])
             store.updated_on = datetime.now(tz=timezone.utc)
             session.commit()
+
+    def create_store_with_admin(
+        self,
+        *,
+        store_code: str,
+        store_name: str,
+        address: str,
+        city: str,
+        manager_name: str,
+        contact_info: str,
+        owner_name: str,
+        owner_mobile: str,
+        owner_email: str,
+        status: str,
+        store_admin_username: str,
+        store_admin_full_name: str,
+        store_admin_mobile: str,
+        store_admin_email: str,
+    ) -> StoreProvisionResult:
+        normalized_store = self._normalize_store_fields(
+            store_code=store_code,
+            store_name=store_name,
+            address=address,
+            city=city,
+            manager_name=manager_name,
+            contact_info=contact_info,
+            status=status,
+        )
+        normalized_owner = self._normalize_owner_fields(
+            owner_name=owner_name,
+            owner_mobile=owner_mobile,
+            owner_email=owner_email,
+        )
+        normalized_admin = self._normalize_store_admin_fields(
+            username=store_admin_username,
+            full_name=store_admin_full_name,
+            mobile=store_admin_mobile,
+            email=store_admin_email,
+            require_all_fields=True,
+        )
+
+        with self._session_factory() as session:
+            existing_store = session.scalar(
+                select(ManagedStoreModel).where(
+                    ManagedStoreModel.store_code == normalized_store["store_code"]
+                )
+            )
+            if existing_store is not None:
+                raise ValueError(f"Store code '{normalized_store['store_code']}' already exists.")
+
+            existing_admin = session.scalar(
+                select(ManagedUserModel).where(
+                    ManagedUserModel.username == normalized_admin["username"]
+                )
+            )
+            if existing_admin is not None:
+                raise ValueError(
+                    f"Username '{normalized_admin['username']}' already exists for the store admin user."
+                )
+
+            now = datetime.now(tz=timezone.utc)
+            store_id = f"store-{uuid4().hex[:8]}"
+            store_admin_user_id = f"u-store-admin-{uuid4().hex[:8]}"
+            temporary_password = self.default_password_for_username(normalized_admin["username"])
+            store = ManagedStoreModel(
+                store_id=store_id,
+                store_code=normalized_store["store_code"],
+                store_name=normalized_store["store_name"],
+                address=normalized_store["address"],
+                city=normalized_store["city"],
+                manager_name=normalized_store["manager_name"],
+                contact_info=normalized_store["contact_info"],
+                owner_name=normalized_owner["owner_name"],
+                owner_mobile=normalized_owner["owner_mobile"],
+                owner_email=normalized_owner["owner_email"],
+                store_admin_user_id=store_admin_user_id,
+                status=normalized_store["status"],
+                created_on=now,
+                updated_on=now,
+            )
+            session.add(store)
+
+            admin_user = self._build_user(
+                user_id=store_admin_user_id,
+                username=normalized_admin["username"],
+                full_name=normalized_admin["full_name"],
+                contact_info=self._compose_contact_info(
+                    mobile=normalized_admin["mobile"],
+                    email=normalized_admin["email"],
+                ),
+                store_id=store_id,
+                created_on=now,
+                roles=["Admin"],
+                permissions=self._permissions_for_selected_role("Admin"),
+                activities=[
+                    (now, f"Store admin account created for {normalized_store['store_name']}"),
+                ],
+            )
+            admin_user.auth_record = ManagedUserAuthModel(
+                user_id=store_admin_user_id,
+                mobile=normalized_admin["mobile"],
+                password_hash=self._password_hasher(temporary_password),
+                failed_attempts=0,
+                lockout_until=None,
+                password_reset_required=True,
+            )
+            session.add(admin_user)
+            session.commit()
+            return StoreProvisionResult(
+                store_id=store_id,
+                store_admin_user_id=store_admin_user_id,
+                store_admin_username=normalized_admin["username"],
+                temporary_password=temporary_password,
+            )
+
+    def update_store_with_admin(
+        self,
+        *,
+        store_id: str,
+        store_code: str,
+        store_name: str,
+        address: str,
+        city: str,
+        manager_name: str,
+        contact_info: str,
+        owner_name: str,
+        owner_mobile: str,
+        owner_email: str,
+        status: str,
+        store_admin_username: str,
+        store_admin_full_name: str,
+        store_admin_mobile: str,
+        store_admin_email: str,
+    ) -> StoreProvisionResult:
+        normalized_store = self._normalize_store_fields(
+            store_code=store_code,
+            store_name=store_name,
+            address=address,
+            city=city,
+            manager_name=manager_name,
+            contact_info=contact_info,
+            status=status,
+        )
+        normalized_owner = self._normalize_owner_fields(
+            owner_name=owner_name,
+            owner_mobile=owner_mobile,
+            owner_email=owner_email,
+        )
+
+        with self._session_factory() as session:
+            store = session.get(ManagedStoreModel, store_id)
+            if store is None:
+                raise ValueError(f"Unknown store: {store_id}")
+
+            duplicate_store = session.scalar(
+                select(ManagedStoreModel).where(
+                    ManagedStoreModel.store_code == normalized_store["store_code"],
+                    ManagedStoreModel.store_id != store_id,
+                )
+            )
+            if duplicate_store is not None:
+                raise ValueError(f"Store code '{normalized_store['store_code']}' already exists.")
+
+            store.store_code = normalized_store["store_code"]
+            store.store_name = normalized_store["store_name"]
+            store.address = normalized_store["address"]
+            store.city = normalized_store["city"]
+            store.manager_name = normalized_store["manager_name"]
+            store.contact_info = normalized_store["contact_info"]
+            store.owner_name = normalized_owner["owner_name"]
+            store.owner_mobile = normalized_owner["owner_mobile"]
+            store.owner_email = normalized_owner["owner_email"]
+            store.status = normalized_store["status"]
+
+            linked_admin = (
+                session.get(ManagedUserModel, store.store_admin_user_id)
+                if store.store_admin_user_id
+                else None
+            )
+            created_password: str | None = None
+
+            if linked_admin is None:
+                normalized_admin = self._normalize_store_admin_fields(
+                    username=store_admin_username,
+                    full_name=store_admin_full_name,
+                    mobile=store_admin_mobile,
+                    email=store_admin_email,
+                    require_all_fields=False,
+                )
+                if normalized_admin is not None:
+                    existing_admin = session.scalar(
+                        select(ManagedUserModel).where(
+                            ManagedUserModel.username == normalized_admin["username"]
+                        )
+                    )
+                    if existing_admin is not None:
+                        raise ValueError(
+                            f"Username '{normalized_admin['username']}' already exists for the store admin user."
+                        )
+                    now = datetime.now(tz=timezone.utc)
+                    store.store_admin_user_id = f"u-store-admin-{uuid4().hex[:8]}"
+                    created_password = self.default_password_for_username(
+                        normalized_admin["username"]
+                    )
+                    admin_user = self._build_user(
+                        user_id=store.store_admin_user_id,
+                        username=normalized_admin["username"],
+                        full_name=normalized_admin["full_name"],
+                        contact_info=self._compose_contact_info(
+                            mobile=normalized_admin["mobile"],
+                            email=normalized_admin["email"],
+                        ),
+                        store_id=store.store_id,
+                        created_on=now,
+                        roles=["Admin"],
+                        permissions=self._permissions_for_selected_role("Admin"),
+                        activities=[
+                            (now, f"Store admin account created for {normalized_store['store_name']}"),
+                        ],
+                    )
+                    admin_user.auth_record = ManagedUserAuthModel(
+                        user_id=store.store_admin_user_id,
+                        mobile=normalized_admin["mobile"],
+                        password_hash=self._password_hasher(created_password),
+                        failed_attempts=0,
+                        lockout_until=None,
+                        password_reset_required=True,
+                    )
+                    session.add(admin_user)
+                    linked_admin = admin_user
+            else:
+                normalized_admin = self._normalize_store_admin_fields(
+                    username=linked_admin.username,
+                    full_name=store_admin_full_name,
+                    mobile=store_admin_mobile,
+                    email=store_admin_email,
+                    require_all_fields=True,
+                )
+                linked_admin.full_name = normalized_admin["full_name"]
+                linked_admin.store_id = store.store_id
+                linked_admin.contact_info = self._compose_contact_info(
+                    mobile=normalized_admin["mobile"],
+                    email=normalized_admin["email"],
+                )
+                linked_admin.roles[:] = [
+                    ManagedUserRoleModel(user_id=linked_admin.user_id, role_name="Admin")
+                ]
+                linked_admin.permissions[:] = [
+                    ManagedUserPermissionModel(
+                        user_id=linked_admin.user_id,
+                        permission_name=permission_name,
+                    )
+                    for permission_name in self._permissions_for_selected_role("Admin")
+                ]
+                linked_admin.activities.insert(
+                    0,
+                    ManagedUserActivityModel(
+                        user_id=linked_admin.user_id,
+                        occurred_at=datetime.now(tz=timezone.utc),
+                        summary=f"Store admin details updated for {normalized_store['store_name']}",
+                    ),
+                )
+                if linked_admin.auth_record is not None:
+                    linked_admin.auth_record.mobile = normalized_admin["mobile"]
+
+            store.updated_on = datetime.now(tz=timezone.utc)
+            session.commit()
+            return StoreProvisionResult(
+                store_id=store.store_id,
+                store_admin_user_id=store.store_admin_user_id,
+                store_admin_username=linked_admin.username if linked_admin is not None else None,
+                temporary_password=created_password,
+            )
 
     def list_role_definitions(self) -> tuple[AdminRoleDefinition, ...]:
         with self._session_factory() as session:
@@ -556,7 +893,160 @@ class AdminUserManagementService:
         target_role = self.role_name_for_user(target_user_id)
         if actor_role is None or target_role is None:
             return False
+        if actor_role != "Superadmin":
+            actor_store_id = self.store_id_for_user(actor_user_id)
+            target_store_id = self.store_id_for_user(target_user_id)
+            if not actor_store_id or actor_store_id != target_store_id:
+                return False
         return target_role in self.CREATOR_ROLE_SCOPE.get(actor_role, ())
+
+    def store_id_for_user(self, user_id: str | None) -> str | None:
+        if user_id is None:
+            return None
+
+        with self._session_factory() as session:
+            user = session.get(ManagedUserModel, user_id)
+            if user is None:
+                return None
+            return user.store_id
+
+    def get_store_for_user(self, user_id: str | None) -> AdminStoreRecord | None:
+        store_id = self.store_id_for_user(user_id)
+        if store_id is None:
+            return None
+        return self.get_store(store_id)
+
+    def get_store_dashboard_context_for_user(
+        self,
+        user_id: str | None,
+    ) -> StoreDashboardContext | None:
+        store_id = self.store_id_for_user(user_id)
+        if store_id is None:
+            return None
+
+        with self._session_factory() as session:
+            store = session.get(ManagedStoreModel, store_id)
+            if store is None:
+                return None
+            user_count = session.scalar(
+                select(func.count()).select_from(ManagedUserModel).where(
+                    ManagedUserModel.store_id == store_id
+                )
+            ) or 0
+            return StoreDashboardContext(
+                store_id=store.store_id,
+                store_code=store.store_code,
+                store_name=store.store_name,
+                address=store.address or "",
+                city=store.city,
+                contact_info=store.contact_info,
+                owner_name=store.owner_name or "",
+                owner_mobile=store.owner_mobile or "",
+                owner_email=store.owner_email or "",
+                status=store.status,
+                user_count=int(user_count),
+            )
+
+    def update_store_profile_for_user(
+        self,
+        *,
+        actor_user_id: str | None,
+        address: str,
+        contact_info: str,
+    ) -> AdminStoreRecord:
+        store_id = self.store_id_for_user(actor_user_id)
+        actor_role = self.role_name_for_user(actor_user_id)
+        if not store_id:
+            raise ValueError("This account is not linked to a store profile.")
+        if actor_role != "Admin":
+            raise ValueError("Only the store admin can update store profile details here.")
+
+        normalized_address = address.strip()
+        normalized_contact_info = contact_info.strip()
+        if not normalized_address:
+            raise ValueError("Store address is required.")
+        if not normalized_contact_info:
+            raise ValueError("Store contact information is required.")
+
+        with self._session_factory() as session:
+            store = session.get(ManagedStoreModel, store_id)
+            if store is None:
+                raise ValueError("The linked store record was not found.")
+            if store.store_admin_user_id != actor_user_id:
+                raise ValueError("Only the linked store admin can update this store profile.")
+
+            store.address = normalized_address
+            store.contact_info = normalized_contact_info
+            store.updated_on = datetime.now(tz=timezone.utc)
+            session.commit()
+            session.refresh(store)
+            return self._to_store_record(store, session=session)
+
+    def reset_to_superadmin_only(self) -> None:
+        with self._session_factory() as session:
+            now = datetime.now(tz=timezone.utc)
+            superadmin = session.scalar(
+                select(ManagedUserModel).where(ManagedUserModel.username == "superadmin")
+            )
+            if superadmin is None:
+                superadmin = self._build_superadmin_user(
+                    user_id=f"u-superadmin-{uuid4().hex[:6]}",
+                    created_on=now - timedelta(days=1),
+                    activity_summary="Superadmin account recreated during environment reset",
+                )
+                session.add(superadmin)
+                session.flush()
+
+            stores = session.scalars(select(ManagedStoreModel)).all()
+            for store in stores:
+                session.delete(store)
+
+            users_to_delete = session.scalars(
+                select(ManagedUserModel).where(ManagedUserModel.user_id != superadmin.user_id)
+            ).all()
+            for user in users_to_delete:
+                session.delete(user)
+
+            superadmin.full_name = superadmin.full_name.strip() or "Superadmin User"
+            superadmin.contact_info = superadmin.contact_info.strip() or (
+                "+15551230000 | superadmin@planning.local"
+            )
+            superadmin.store_id = None
+            superadmin.roles[:] = [
+                ManagedUserRoleModel(user_id=superadmin.user_id, role_name="Superadmin")
+            ]
+            superadmin.permissions[:] = [
+                ManagedUserPermissionModel(
+                    user_id=superadmin.user_id,
+                    permission_name=permission_name,
+                )
+                for permission_name in self._permissions_for_selected_role("Superadmin")
+            ]
+            superadmin.activities[:] = [
+                ManagedUserActivityModel(
+                    user_id=superadmin.user_id,
+                    occurred_at=now,
+                    summary="Environment reset to superadmin-only baseline",
+                )
+            ]
+            if superadmin.auth_record is None:
+                superadmin.auth_record = ManagedUserAuthModel(
+                    user_id=superadmin.user_id,
+                    mobile=self._extract_mobile(superadmin.contact_info),
+                    password_hash=self._password_hasher(
+                        self.default_password_for_username("superadmin")
+                    ),
+                    failed_attempts=0,
+                    lockout_until=None,
+                    password_reset_required=False,
+                )
+            else:
+                superadmin.auth_record.mobile = self._extract_mobile(superadmin.contact_info)
+                superadmin.auth_record.failed_attempts = 0
+                superadmin.auth_record.lockout_until = None
+                superadmin.auth_record.password_reset_required = False
+
+            session.commit()
 
     def default_password_for_username(self, username: str) -> str:
         normalized_username = username.strip().lower()
@@ -567,6 +1057,11 @@ class AdminUserManagementService:
             user = session.get(ManagedUserModel, user_id)
             if user is None:
                 return None
+            store = (
+                session.get(ManagedStoreModel, user.store_id)
+                if user.store_id
+                else None
+            )
 
             activities = sorted(
                 (
@@ -584,6 +1079,8 @@ class AdminUserManagementService:
                 full_name=user.full_name,
                 username=user.username,
                 contact_info=user.contact_info,
+                store_id=user.store_id,
+                store_name=store.store_name if store is not None else "",
                 created_on=self._ensure_utc(user.created_on),
                 roles=self._ordered_role_names(tuple(role.role_name for role in user.roles)),
                 permissions=tuple(
@@ -597,18 +1094,27 @@ class AdminUserManagementService:
     def save_user_profile(
         self,
         *,
+        actor_user_id: str | None,
         user_id: str,
         full_name: str,
         contact_info: str,
         roles: list[str],
         permissions: list[str],
     ) -> None:
+        if actor_user_id is not None and not self.can_actor_manage_user(actor_user_id, user_id):
+            raise ValueError("This account cannot manage the selected user.")
+
         with self._session_factory() as session:
             user = session.get(ManagedUserModel, user_id)
             if user is None:
                 raise ValueError(f"Unknown managed user: {user_id}")
 
             selected_role = self._normalize_role_selection(roles)
+            allowed_roles = set(self.available_roles_for_actor(actor_user_id))
+            actor_role = self.role_name_for_user(actor_user_id)
+            if actor_user_id is not None and actor_role != "Superadmin" and selected_role not in allowed_roles:
+                allowed_label = ", ".join(sorted(allowed_roles)) or "no roles"
+                raise ValueError(f"This account can only assign these roles: {allowed_label}.")
             derived_permissions = self._permissions_for_selected_role(selected_role)
             user.full_name = full_name.strip()
             user.contact_info = contact_info.strip()
@@ -626,6 +1132,7 @@ class AdminUserManagementService:
     def create_user(
         self,
         *,
+        actor_user_id: str | None,
         username: str,
         full_name: str,
         contact_info: str,
@@ -645,6 +1152,14 @@ class AdminUserManagementService:
         if not temporary_password:
             raise ValueError("A temporary password is required before a new user can be created.")
 
+        selected_role = self._normalize_role_selection(roles)
+        actor_role = self.role_name_for_user(actor_user_id)
+        allowed_roles = set(self.available_roles_for_actor(actor_user_id))
+        if actor_user_id is not None and actor_role != "Superadmin" and selected_role not in allowed_roles:
+            allowed_label = ", ".join(sorted(allowed_roles)) or "no roles"
+            raise ValueError(f"This account can only create these roles: {allowed_label}.")
+        store_scope_id = self._resolve_store_scope(actor_user_id=actor_user_id)
+
         with self._session_factory() as session:
             existing_user = session.scalar(
                 select(ManagedUserModel).where(ManagedUserModel.username == normalized_username)
@@ -659,11 +1174,17 @@ class AdminUserManagementService:
                 username=normalized_username,
                 full_name=normalized_full_name,
                 contact_info=normalized_contact_info,
+                store_id=store_scope_id,
                 created_on=created_on,
-                roles=[self._normalize_role_selection(roles)],
-                permissions=self._permissions_for_selected_role(self._normalize_role_selection(roles)),
+                roles=[selected_role],
+                permissions=self._permissions_for_selected_role(selected_role),
                 activities=[
-                    (created_on, "User record created in admin console"),
+                    (
+                        created_on,
+                        "User record created in admin console"
+                        if store_scope_id is None
+                        else f"User record created in store workspace ({store_scope_id})",
+                    ),
                 ],
             )
             user.auth_record = ManagedUserAuthModel(
@@ -706,66 +1227,13 @@ class AdminUserManagementService:
                 return
 
             now = datetime.now(tz=timezone.utc)
-            users = [
-                self._build_user(
+            session.add(
+                self._build_superadmin_user(
                     user_id="u-superadmin-1",
-                    username="superadmin",
-                    full_name="Superadmin User",
-                    contact_info="+15551230000 | superadmin@planning.local",
                     created_on=now - timedelta(days=90),
-                    roles=["Superadmin"],
-                    permissions=list(self.permissions_for_role("Superadmin")),
-                    activities=[
-                        (now - timedelta(hours=2), "Created the first admin account"),
-                        (now - timedelta(days=1, hours=1), "Reviewed hierarchy permissions"),
-                        (now - timedelta(days=3), "Signed in from the primary workstation"),
-                    ],
-                ),
-                self._build_user(
-                    user_id="u-admin-1001",
-                    username="admin",
-                    full_name="General Admin",
-                    contact_info="+15551230001 | admin@planning.local",
-                    created_on=now - timedelta(days=60),
-                    roles=["Admin"],
-                    permissions=list(self.permissions_for_role("Admin")),
-                    activities=[
-                        (now - timedelta(hours=4), "Created a new worker account"),
-                        (now - timedelta(days=2), "Updated a manager profile"),
-                        (now - timedelta(days=5), "Reviewed non-superadmin users"),
-                    ],
-                ),
-                self._build_user(
-                    user_id="u-manager-1001",
-                    username="manager",
-                    full_name="Manager User",
-                    contact_info="+15551230002 | manager@planning.local",
-                    created_on=now - timedelta(days=45),
-                    roles=["Manager"],
-                    permissions=list(self.permissions_for_role("Manager")),
-                    activities=[
-                        (now - timedelta(hours=4), "Created a customer order"),
-                        (now - timedelta(days=1, hours=3), "Updated customer billing receipt"),
-                        (now - timedelta(days=5), "Moved an order to delivered"),
-                    ],
-                ),
-                self._build_user(
-                    user_id="u-worker-1001",
-                    username="worker",
-                    full_name="Worker User",
-                    contact_info="+15551230003 | worker@planning.local",
-                    created_on=now - timedelta(days=32),
-                    roles=["Worker"],
-                    permissions=list(self.permissions_for_role("Worker")),
-                    activities=[
-                        (now - timedelta(hours=6), "Updated an order to in progress"),
-                        (now - timedelta(days=2), "Marked a ready order for dispatch"),
-                        (now - timedelta(days=6), "Reviewed assigned order details"),
-                    ],
-                ),
-            ]
-
-            session.add_all(users)
+                    activity_summary="Created the initial superadmin account",
+                )
+            )
             session.commit()
 
     def _ensure_default_hierarchy_users(self) -> None:
@@ -778,54 +1246,10 @@ class AdminUserManagementService:
             bootstrap_users: list[ManagedUserModel] = []
             if "superadmin" not in existing_usernames:
                 bootstrap_users.append(
-                    self._build_user(
+                    self._build_superadmin_user(
                         user_id=f"u-superadmin-{uuid4().hex[:6]}",
-                        username="superadmin",
-                        full_name="Superadmin User",
-                        contact_info="+15551230000 | superadmin@planning.local",
                         created_on=now - timedelta(days=90),
-                        roles=["Superadmin"],
-                        permissions=list(self.permissions_for_role("Superadmin")),
-                        activities=[(now - timedelta(days=1), "Bootstrap superadmin account created")],
-                    )
-                )
-            if "admin" not in existing_usernames:
-                bootstrap_users.append(
-                    self._build_user(
-                        user_id=f"u-admin-{uuid4().hex[:6]}",
-                        username="admin",
-                        full_name="General Admin",
-                        contact_info="+15551230001 | admin@planning.local",
-                        created_on=now - timedelta(days=60),
-                        roles=["Admin"],
-                        permissions=list(self.permissions_for_role("Admin")),
-                        activities=[(now - timedelta(days=1), "Bootstrap admin account created")],
-                    )
-                )
-            if "manager" not in existing_usernames:
-                bootstrap_users.append(
-                    self._build_user(
-                        user_id=f"u-manager-{uuid4().hex[:6]}",
-                        username="manager",
-                        full_name="Manager User",
-                        contact_info="+15551230002 | manager@planning.local",
-                        created_on=now - timedelta(days=45),
-                        roles=["Manager"],
-                        permissions=list(self.permissions_for_role("Manager")),
-                        activities=[(now - timedelta(days=1), "Bootstrap manager account created")],
-                    )
-                )
-            if "worker" not in existing_usernames:
-                bootstrap_users.append(
-                    self._build_user(
-                        user_id=f"u-worker-{uuid4().hex[:6]}",
-                        username="worker",
-                        full_name="Worker User",
-                        contact_info="+15551230003 | worker@planning.local",
-                        created_on=now - timedelta(days=30),
-                        roles=["Worker"],
-                        permissions=list(self.permissions_for_role("Worker")),
-                        activities=[(now - timedelta(days=1), "Bootstrap worker account created")],
+                        activity_summary="Bootstrap superadmin account created",
                     )
                 )
 
@@ -879,50 +1303,43 @@ class AdminUserManagementService:
                 session.commit()
 
     def _ensure_store_catalog(self) -> None:
-        with self._session_factory() as session:
-            store_count = session.scalar(select(func.count()).select_from(ManagedStoreModel)) or 0
-            if store_count:
-                return
+        return
 
-            now = datetime.now(tz=timezone.utc)
-            session.add_all(
-                [
-                    ManagedStoreModel(
-                        store_id="store-1001",
-                        store_code="ST-SEA",
-                        store_name="Seattle Flagship",
-                        city="Seattle",
-                        manager_name="Avery Brooks",
-                        contact_info="+15551001001 | seattle@planning.local",
-                        status="Active",
-                        created_on=now - timedelta(days=180),
-                        updated_on=now - timedelta(days=2),
-                    ),
-                    ManagedStoreModel(
-                        store_id="store-1002",
-                        store_code="ST-AUS",
-                        store_name="Austin Operations Hub",
-                        city="Austin",
-                        manager_name="Jordan Kim",
-                        contact_info="+15551001002 | austin@planning.local",
-                        status="Active",
-                        created_on=now - timedelta(days=150),
-                        updated_on=now - timedelta(days=4),
-                    ),
-                    ManagedStoreModel(
-                        store_id="store-1003",
-                        store_code="ST-DEN",
-                        store_name="Denver Prep Center",
-                        city="Denver",
-                        manager_name="Taylor Reed",
-                        contact_info="+15551001003 | denver@planning.local",
-                        status="Inactive",
-                        created_on=now - timedelta(days=120),
-                        updated_on=now - timedelta(days=12),
-                    ),
-                ]
-            )
-            session.commit()
+    def _backfill_store_metadata(self) -> None:
+        with self._session_factory() as session:
+            stores = session.scalars(select(ManagedStoreModel)).all()
+            updated = False
+            for store in stores:
+                if store.address is None:
+                    store.address = ""
+                    updated = True
+                if not store.owner_name:
+                    store.owner_name = store.manager_name
+                    updated = True
+                if not store.owner_mobile:
+                    store.owner_mobile = self._extract_mobile(store.contact_info) or ""
+                    updated = True
+                if not store.owner_email:
+                    store.owner_email = self._extract_email(store.contact_info) or ""
+                    updated = True
+            if updated:
+                session.commit()
+
+    def _backfill_store_user_assignments(self) -> None:
+        with self._session_factory() as session:
+            stores = session.scalars(select(ManagedStoreModel)).all()
+            updated = False
+            for store in stores:
+                if not store.store_admin_user_id:
+                    continue
+                store_admin = session.get(ManagedUserModel, store.store_admin_user_id)
+                if store_admin is None:
+                    continue
+                if store_admin.store_id != store.store_id:
+                    store_admin.store_id = store.store_id
+                    updated = True
+            if updated:
+                session.commit()
 
     def _ensure_auth_records(self) -> None:
         with self._session_factory() as session:
@@ -974,6 +1391,7 @@ class AdminUserManagementService:
         username: str,
         full_name: str,
         contact_info: str,
+        store_id: str | None,
         created_on: datetime,
         roles: list[str],
         permissions: list[str],
@@ -984,6 +1402,7 @@ class AdminUserManagementService:
             username=username,
             full_name=full_name,
             contact_info=contact_info,
+            store_id=store_id,
             created_on=created_on,
         )
         user.roles = [
@@ -1004,14 +1423,60 @@ class AdminUserManagementService:
         ]
         return user
 
-    def _to_store_record(self, row: ManagedStoreModel) -> AdminStoreRecord:
+    def _build_superadmin_user(
+        self,
+        *,
+        user_id: str,
+        created_on: datetime,
+        activity_summary: str,
+    ) -> ManagedUserModel:
+        return self._build_user(
+            user_id=user_id,
+            username="superadmin",
+            full_name="Superadmin User",
+            contact_info="+15551230000 | superadmin@planning.local",
+            store_id=None,
+            created_on=created_on,
+            roles=["Superadmin"],
+            permissions=list(self.permissions_for_role("Superadmin")),
+            activities=[(created_on, activity_summary)],
+        )
+
+    def _to_store_record(
+        self,
+        row: ManagedStoreModel,
+        *,
+        session: Session | None = None,
+    ) -> AdminStoreRecord:
+        store_admin = (
+            session.get(ManagedUserModel, row.store_admin_user_id)
+            if session is not None and row.store_admin_user_id
+            else None
+        )
         return AdminStoreRecord(
             store_id=row.store_id,
             store_code=row.store_code,
             store_name=row.store_name,
+            address=row.address or "",
             city=row.city,
             manager_name=row.manager_name,
             contact_info=row.contact_info,
+            owner_name=row.owner_name or "",
+            owner_mobile=row.owner_mobile or "",
+            owner_email=row.owner_email or "",
+            store_admin_user_id=row.store_admin_user_id,
+            store_admin_username=store_admin.username if store_admin is not None else "",
+            store_admin_full_name=store_admin.full_name if store_admin is not None else "",
+            store_admin_mobile=(
+                self._extract_mobile(store_admin.contact_info) or ""
+                if store_admin is not None
+                else ""
+            ),
+            store_admin_email=(
+                self._extract_email(store_admin.contact_info) or ""
+                if store_admin is not None
+                else ""
+            ),
             status=row.status,
             created_on=self._ensure_utc(row.created_on),
             updated_on=self._ensure_utc(row.updated_on),
@@ -1033,11 +1498,188 @@ class AdminUserManagementService:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
 
+    def _resolve_store_scope(
+        self,
+        *,
+        actor_user_id: str | None = None,
+        explicit_store_id: str | None = None,
+    ) -> str | None:
+        if explicit_store_id is not None:
+            return explicit_store_id
+        actor_role = self.role_name_for_user(actor_user_id)
+        if actor_role == "Superadmin":
+            return None
+        return self.store_id_for_user(actor_user_id)
+
     def _extract_mobile(self, contact_info: str) -> str | None:
         match = re.search(r"\+\d{7,15}", contact_info)
         if match is None:
             return None
         return match.group(0)
+
+    def _extract_email(self, contact_info: str) -> str | None:
+        match = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", contact_info, flags=re.IGNORECASE)
+        if match is None:
+            return None
+        return match.group(0)
+
+    def _compose_contact_info(self, *, mobile: str, email: str) -> str:
+        contact_parts = [mobile.strip(), email.strip().lower()]
+        return " | ".join(part for part in contact_parts if part)
+
+    def _normalize_store_fields(
+        self,
+        *,
+        store_code: str,
+        store_name: str,
+        address: str,
+        city: str,
+        manager_name: str,
+        contact_info: str,
+        status: str,
+    ) -> dict[str, str]:
+        normalized_store_code = store_code.strip().upper()
+        normalized_store_name = store_name.strip()
+        normalized_address = address.strip()
+        normalized_city = city.strip()
+        normalized_manager_name = manager_name.strip()
+        normalized_contact_info = contact_info.strip()
+        normalized_status = self._normalize_store_status(status)
+        if not normalized_store_code:
+            raise ValueError("Store code is required.")
+        if not normalized_store_name:
+            raise ValueError("Store name is required.")
+        if not normalized_address:
+            raise ValueError("Store address is required.")
+        if not normalized_city:
+            raise ValueError("City is required.")
+        if not normalized_manager_name:
+            raise ValueError("Manager name is required.")
+        if not normalized_contact_info:
+            raise ValueError("Store contact information is required.")
+        return {
+            "store_code": normalized_store_code,
+            "store_name": normalized_store_name,
+            "address": normalized_address,
+            "city": normalized_city,
+            "manager_name": normalized_manager_name,
+            "contact_info": normalized_contact_info,
+            "status": normalized_status,
+        }
+
+    def _normalize_owner_fields(
+        self,
+        *,
+        owner_name: str,
+        owner_mobile: str,
+        owner_email: str,
+    ) -> dict[str, str]:
+        normalized_owner_name = owner_name.strip()
+        normalized_owner_mobile = owner_mobile.strip()
+        normalized_owner_email = owner_email.strip().lower()
+        if not normalized_owner_name:
+            raise ValueError("Store owner name is required.")
+        if not normalized_owner_mobile:
+            raise ValueError("Store owner mobile is required.")
+        if not normalized_owner_email:
+            raise ValueError("Store owner email is required.")
+        return {
+            "owner_name": normalized_owner_name,
+            "owner_mobile": normalized_owner_mobile,
+            "owner_email": normalized_owner_email,
+        }
+
+    def _normalize_store_admin_fields(
+        self,
+        *,
+        username: str,
+        full_name: str,
+        mobile: str,
+        email: str,
+        require_all_fields: bool,
+    ) -> dict[str, str] | None:
+        normalized_username = username.strip().lower()
+        normalized_full_name = full_name.strip()
+        normalized_mobile = mobile.strip()
+        normalized_email = email.strip().lower()
+        field_values = (
+            normalized_username,
+            normalized_full_name,
+            normalized_mobile,
+            normalized_email,
+        )
+        if not any(field_values):
+            if require_all_fields:
+                raise ValueError("Store admin user details are required.")
+            return None
+        if not all(field_values):
+            raise ValueError(
+                "Store admin username, name, mobile, and email are all required together."
+            )
+        if not re.fullmatch(r"[a-zA-Z0-9._-]+", normalized_username):
+            raise ValueError(
+                "Store admin username can only contain letters, numbers, dots, underscores, and hyphens."
+            )
+        return {
+            "username": normalized_username,
+            "full_name": normalized_full_name,
+            "mobile": normalized_mobile,
+            "email": normalized_email,
+        }
+
+    def _ensure_user_schema_columns(self) -> None:
+        inspector = inspect(self._engine)
+        table_names = set(inspector.get_table_names())
+        if "managed_users" not in table_names:
+            return
+
+        existing_columns = {
+            column["name"]
+            for column in inspector.get_columns("managed_users")
+        }
+        required_columns = {
+            "store_id": "ALTER TABLE managed_users ADD COLUMN store_id VARCHAR(50)",
+        }
+        missing_statements = [
+            statement
+            for column_name, statement in required_columns.items()
+            if column_name not in existing_columns
+        ]
+        if not missing_statements:
+            return
+
+        with self._engine.begin() as connection:
+            for statement in missing_statements:
+                connection.exec_driver_sql(statement)
+
+    def _ensure_store_schema_columns(self) -> None:
+        inspector = inspect(self._engine)
+        table_names = set(inspector.get_table_names())
+        if "managed_stores" not in table_names:
+            return
+
+        existing_columns = {
+            column["name"]
+            for column in inspector.get_columns("managed_stores")
+        }
+        required_columns = {
+            "address": "ALTER TABLE managed_stores ADD COLUMN address VARCHAR(250)",
+            "owner_name": "ALTER TABLE managed_stores ADD COLUMN owner_name VARCHAR(150)",
+            "owner_mobile": "ALTER TABLE managed_stores ADD COLUMN owner_mobile VARCHAR(50)",
+            "owner_email": "ALTER TABLE managed_stores ADD COLUMN owner_email VARCHAR(200)",
+            "store_admin_user_id": "ALTER TABLE managed_stores ADD COLUMN store_admin_user_id VARCHAR(50)",
+        }
+        missing_statements = [
+            statement
+            for column_name, statement in required_columns.items()
+            if column_name not in existing_columns
+        ]
+        if not missing_statements:
+            return
+
+        with self._engine.begin() as connection:
+            for statement in missing_statements:
+                connection.exec_driver_sql(statement)
 
     def _ordered_role_names(self, role_names: tuple[str, ...] | list[str]) -> tuple[str, ...]:
         present_role_names = set(role_names)

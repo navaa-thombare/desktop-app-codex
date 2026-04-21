@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import re
-import secrets
-import string
 from dataclasses import dataclass
 from datetime import timezone
 from typing import Callable
@@ -15,6 +13,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHeaderView,
     QHBoxLayout,
     QLabel,
@@ -425,12 +424,14 @@ class ManageUsersScreen(QWidget):
     def __init__(
         self,
         *,
+        current_user_id: str | None,
         user_management_service: AdminUserManagementService,
         on_admin_change: Callable[[str, str], None] | None = None,
         on_permission_change: Callable[[str, str], None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self._current_user_id = current_user_id
         self._user_management_service = user_management_service
         self._on_admin_change = on_admin_change
         self._on_permission_change = on_permission_change
@@ -456,11 +457,12 @@ class ManageUsersScreen(QWidget):
 
         intro_heading = QLabel("Manage User Profile")
         intro_heading.setObjectName("ManagePageTitle")
-        intro_copy = QLabel(
-            "Choose an existing user by name or start a new user record, then review access assignments and inspect the latest activity first."
-        )
-        intro_copy.setObjectName("ManageMutedText")
-        intro_copy.setWordWrap(True)
+        self.intro_copy = QLabel("")
+        self.intro_copy.setObjectName("ManageMutedText")
+        self.intro_copy.setWordWrap(True)
+        self.scope_label = QLabel("")
+        self.scope_label.setObjectName("ManageFeedback")
+        self.scope_label.setWordWrap(True)
 
         selector_row = QHBoxLayout()
         selector_label = QLabel("User name")
@@ -475,7 +477,8 @@ class ManageUsersScreen(QWidget):
         selector_row.addStretch(1)
 
         intro_layout.addWidget(intro_heading)
-        intro_layout.addWidget(intro_copy)
+        intro_layout.addWidget(self.intro_copy)
+        intro_layout.addWidget(self.scope_label)
         intro_layout.addLayout(selector_row)
 
         password_panel = QWidget()
@@ -640,6 +643,7 @@ class ManageUsersScreen(QWidget):
 
         self._is_creating_user = False
         self._temporary_password_value = ""
+        self.refresh_reference_data()
         self._populate_user_selector()
         self.user_selector.currentIndexChanged.connect(self._on_user_selection_changed)
         self.add_user_button.clicked.connect(self._start_new_user)
@@ -670,7 +674,7 @@ class ManageUsersScreen(QWidget):
         self.save_changes_button.setText("Create User" if creating_user else "Save User Details")
 
     def _populate_user_selector(self, selected_user_id: str | None = None) -> None:
-        users = self._user_management_service.list_users()
+        users = self._user_management_service.list_users(actor_user_id=self._current_user_id)
         self.user_selector.blockSignals(True)
         self.user_selector.clear()
         selected_index = 0
@@ -702,9 +706,12 @@ class ManageUsersScreen(QWidget):
     def refresh_reference_data(self) -> None:
         selected_roles = self._checked_values(self.roles_list)
         selected_permissions = self._checked_values(self.permissions_list)
+        available_roles = self._user_management_service.available_roles_for_actor(
+            self._current_user_id
+        )
         self._populate_checkable_list(
             self.roles_list,
-            list(self._user_management_service.role_options()),
+            list(available_roles),
         )
         self._populate_checkable_list(
             self.permissions_list,
@@ -712,6 +719,18 @@ class ManageUsersScreen(QWidget):
         )
         self._set_checked_items(self.roles_list, selected_roles)
         self._set_checked_items(self.permissions_list, selected_permissions)
+        self.add_user_button.setVisible(
+            self._user_management_service.can_actor_create_users(self._current_user_id)
+        )
+        self._refresh_scope_copy()
+
+    def set_current_user_id(self, current_user_id: str | None) -> None:
+        self._current_user_id = current_user_id
+        self._hide_temporary_password()
+        self._set_manage_mode(creating_user=False)
+        self.refresh_reference_data()
+        self._populate_user_selector()
+        self._load_selected_user()
 
     def _selected_user_id(self) -> str | None:
         user_id = self.user_selector.currentData()
@@ -740,6 +759,19 @@ class ManageUsersScreen(QWidget):
     def _load_selected_user(self) -> None:
         user_id = self._selected_user_id()
         if user_id is None:
+            self.full_name_input.clear()
+            self.username_input.clear()
+            self.contact_info_input.clear()
+            self.created_on_input.clear()
+            self._set_checked_items(self.roles_list, [])
+            self._set_checked_items(self.permissions_list, [])
+            self._set_activity_rows(
+                rows=[("-", "No store-scoped users are currently available.")],
+                summary="Create a new store user to populate this workspace.",
+            )
+            self.feedback_label.setText(
+                "No users are available in the current store scope yet."
+            )
             return
 
         profile = self._user_management_service.get_user_profile(user_id)
@@ -888,13 +920,18 @@ class ManageUsersScreen(QWidget):
             )
             return
 
-        self._user_management_service.save_user_profile(
-            user_id=user_id,
-            full_name=full_name,
-            contact_info=contact_info,
-            roles=selected_roles,
-            permissions=selected_permissions,
-        )
+        try:
+            self._user_management_service.save_user_profile(
+                actor_user_id=self._current_user_id,
+                user_id=user_id,
+                full_name=full_name,
+                contact_info=contact_info,
+                roles=selected_roles,
+                permissions=selected_permissions,
+            )
+        except ValueError as exc:
+            self.feedback_label.setText(str(exc))
+            return
 
         if (profile.full_name != full_name or profile.contact_info != contact_info) and self._on_admin_change is not None:
             self._on_admin_change("update_user_profile", f"{user_id}:{full_name}:{contact_info}")
@@ -932,9 +969,10 @@ class ManageUsersScreen(QWidget):
             )
             return
 
-        temporary_password = self._generate_temporary_password()
+        temporary_password = self._user_management_service.default_password_for_username(username)
         try:
             user_id = self._user_management_service.create_user(
+                actor_user_id=self._current_user_id,
                 username=username,
                 full_name=full_name,
                 contact_info=contact_info,
@@ -970,17 +1008,25 @@ class ManageUsersScreen(QWidget):
             f"Created {full_name} with username {normalized_username}. Share the temporary password now because it is only shown at creation time."
         )
 
-    def _generate_temporary_password(self) -> str:
-        alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
-        password_characters = [
-            secrets.choice(string.ascii_uppercase),
-            secrets.choice(string.ascii_lowercase),
-            secrets.choice(string.digits),
-            secrets.choice("!@#$%^&*"),
-        ]
-        password_characters.extend(secrets.choice(alphabet) for _ in range(10))
-        secrets.SystemRandom().shuffle(password_characters)
-        return "".join(password_characters)
+    def _refresh_scope_copy(self) -> None:
+        store_context = self._user_management_service.get_store_dashboard_context_for_user(
+            self._current_user_id
+        )
+        if store_context is None:
+            self.intro_copy.setText(
+                "Choose an existing user by name or start a new user record, then review access assignments and inspect the latest activity first."
+            )
+            self.scope_label.hide()
+            return
+
+        self.intro_copy.setText(
+            "This workspace is scoped to the signed-in store. Only users created for this store appear here, and any new users created here will belong to the same store."
+        )
+        location_line = store_context.address or store_context.city
+        self.scope_label.setText(
+            f"{store_context.store_name} | {location_line} | {store_context.contact_info}"
+        )
+        self.scope_label.show()
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
@@ -1185,137 +1231,330 @@ class StoreEditorDialog(QDialog):
         *,
         title: str,
         user_management_service: AdminUserManagementService,
-        initial_values: dict[str, str] | None,
+        initial_values: dict[str, object] | None,
         on_submit: Callable[[dict[str, object]], None],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self._user_management_service = user_management_service
         self._on_submit = on_submit
         is_editing = bool(initial_values)
+        values = initial_values or {}
+        self._existing_store_admin_user_id = str(values.get("store_admin_user_id", "") or "")
         self.setWindowTitle(title)
         self.setModal(True)
-        self.resize(680, 480)
+        self.resize(980, 760)
+        self.setMinimumSize(920, 680)
         self.setStyleSheet(
-            "QDialog { background-color: #fffaf3; color: #1f2933; } "
-            "QLabel { color: #1f2933; } "
-            "QLineEdit, QComboBox { background-color: white; color: #1f2933; border: 1px solid #d7c9b8; "
-            "border-radius: 10px; padding: 8px 10px; } "
-            "QComboBox QAbstractItemView { background-color: white; color: #1f2933; "
-            "border: 1px solid #d7c9b8; selection-background-color: #dbe8df; "
-            "selection-color: #1f2933; } "
-            "QLineEdit[readOnly=\"true\"] { background-color: #f4ede3; color: #5e584f; }"
+            "QDialog { background-color: #fbf7f1; color: #1f2933; } "
+            "QScrollArea { background: transparent; border: none; } "
+            "QWidget#StoreEditorScrollContent { background: transparent; } "
+            "QFrame#EditorCard { background-color: #fffdf9; border: 1px solid #e4d8c9; border-radius: 18px; } "
+            "QLabel#DialogHeading { font-size: 22px; font-weight: 700; color: #102a43; } "
+            "QLabel#DialogCopy { font-size: 13px; color: #52606d; } "
+            "QLabel#SectionTitle { font-size: 16px; font-weight: 700; color: #102a43; } "
+            "QLabel#SectionCopy { font-size: 12px; color: #6b7280; } "
+            "QLabel#FieldLabel { font-size: 13px; font-weight: 600; color: #334e68; padding-top: 10px; } "
+            "QLabel#InlineNote { background-color: #eef6f2; color: #245247; border: 1px solid #cfe2d8; "
+            "border-radius: 12px; padding: 10px 12px; } "
+            "QLabel#FeedbackBanner { background-color: #fffaeb; color: #8b5a2b; border: 1px solid #e6d7c5; "
+            "border-radius: 12px; padding: 10px 12px; } "
+            "QLineEdit, QComboBox { background-color: white; color: #102a43; border: 1px solid #cfd8e3; "
+            "border-radius: 12px; padding: 10px 12px; placeholder-text-color: #829ab1; } "
+            "QLineEdit:focus, QComboBox:focus { border: 1px solid #174c4f; } "
+            "QComboBox::drop-down { border: none; width: 28px; } "
+            "QComboBox QAbstractItemView { background-color: white; color: #102a43; border: 1px solid #cfd8e3; "
+            "selection-background-color: #dbe8df; selection-color: #102a43; } "
+            "QLineEdit[readOnly=\"true\"] { background-color: #f5efe7; color: #5e584f; border: 1px solid #d9cfbf; } "
+            "QPushButton#SecondaryDialogButton { background-color: #fffdf9; color: #174c4f; border: 1px solid #c6d5cf; "
+            "border-radius: 12px; padding: 0 18px; font-weight: 600; } "
+            "QPushButton#SecondaryDialogButton:hover { background-color: #f3f8f5; } "
+            "QPushButton#PrimaryDialogButton { background-color: #174c4f; color: white; border: 1px solid #174c4f; "
+            "border-radius: 12px; padding: 0 18px; font-weight: 600; } "
+            "QPushButton#PrimaryDialogButton:hover { background-color: #123d40; border-color: #123d40; } "
+            "QPushButton#PrimaryDialogButton:pressed { background-color: #103638; border-color: #103638; }"
         )
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 20, 20, 20)
-        root.setSpacing(16)
+        root.setContentsMargins(24, 24, 24, 24)
+        root.setSpacing(18)
 
         heading = QLabel(title)
-        heading.setStyleSheet("font-size: 20px; font-weight: 700; color: #1f2933;")
+        heading.setObjectName("DialogHeading")
         copy = QLabel(
-            "Review the selected store record, adjust the editable details, and save the catalog update."
+            "Review the selected store record, update owner contact details, and manage the linked store-admin account."
             if is_editing
-            else "Create a new store profile in the superadmin catalog."
+            else "Create a store, capture the owner contact information, and provision the initial store-admin user."
         )
         copy.setWordWrap(True)
-        copy.setStyleSheet("color: #5e584f;")
+        copy.setObjectName("DialogCopy")
 
         title_block = QVBoxLayout()
-        title_block.setSpacing(4)
+        title_block.setSpacing(6)
         title_block.addWidget(heading)
         title_block.addWidget(copy)
 
         header_row = QHBoxLayout()
-        header_row.setSpacing(12)
+        header_row.setSpacing(14)
         header_row.addLayout(title_block, stretch=1)
 
         cancel_button = QPushButton("Cancel")
-        cancel_button.setMinimumHeight(38)
-        cancel_button.setStyleSheet(
-            "background-color: #efe5d9; color: #1f2933; border: 1px solid #d7c9b8;"
-        )
-        submit_button = QPushButton("Update" if is_editing else "Create")
-        submit_button.setMinimumHeight(38)
-        submit_button.setStyleSheet(
-            "background-color: #174c4f; color: white; border: 1px solid #174c4f; padding: 0 16px;"
-        )
+        cancel_button.setObjectName("SecondaryDialogButton")
+        cancel_button.setMinimumHeight(44)
+        cancel_button.setMinimumWidth(120)
+        submit_button = QPushButton("Update Store" if is_editing else "Create Store")
+        submit_button.setObjectName("PrimaryDialogButton")
+        submit_button.setMinimumHeight(44)
+        submit_button.setMinimumWidth(148)
+        submit_button.setDefault(True)
         header_row.addWidget(cancel_button)
         header_row.addWidget(submit_button)
 
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(12)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_content = QWidget()
+        scroll_content.setObjectName("StoreEditorScrollContent")
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setSpacing(16)
+
+        cards_grid = QGridLayout()
+        cards_grid.setContentsMargins(0, 0, 0, 0)
+        cards_grid.setHorizontalSpacing(16)
+        cards_grid.setVerticalSpacing(16)
+        cards_grid.setColumnStretch(0, 1)
+        cards_grid.setColumnStretch(1, 1)
 
         self.store_code_input = QLineEdit()
         self.store_name_input = QLineEdit()
+        self.address_input = QLineEdit()
         self.city_input = QLineEdit()
         self.manager_name_input = QLineEdit()
         self.contact_info_input = QLineEdit()
         self.status_combo = QComboBox()
         self._store_status_options = ("Active", "Inactive")
         self.status_combo.addItems(list(self._store_status_options))
-        self.status_combo.setMinimumHeight(42)
+        self.status_combo.setMinimumHeight(44)
         self.status_combo.setMaxVisibleItems(len(self._store_status_options))
-        self.status_combo.setStyleSheet(
-            "QComboBox { background-color: white; color: #1f2933; border: 1px solid #d7c9b8; "
-            "border-radius: 10px; padding: 8px 10px; } "
-            "QComboBox QAbstractItemView { background-color: white; color: #1f2933; "
-            "border: 1px solid #d7c9b8; selection-background-color: #dbe8df; "
-            "selection-color: #1f2933; }"
-        )
         self.created_on_input = QLineEdit()
         self.created_on_input.setReadOnly(True)
         self.updated_on_input = QLineEdit()
         self.updated_on_input.setReadOnly(True)
 
-        form.addRow("Store code", self.store_code_input)
-        form.addRow("Store name", self.store_name_input)
-        form.addRow("City", self.city_input)
-        form.addRow("Manager", self.manager_name_input)
-        form.addRow("Contact", self.contact_info_input)
-        form.addRow("Status", self.status_combo)
-        form.addRow("Created on", self.created_on_input)
-        form.addRow("Last updated", self.updated_on_input)
+        self.owner_name_input = QLineEdit()
+        self.owner_mobile_input = QLineEdit()
+        self.owner_email_input = QLineEdit()
+
+        self.store_admin_full_name_input = QLineEdit()
+        self.store_admin_username_input = QLineEdit()
+        self.store_admin_mobile_input = QLineEdit()
+        self.store_admin_email_input = QLineEdit()
+        self.store_admin_role_input = QLineEdit("Admin")
+        self.store_admin_role_input.setReadOnly(True)
+
+        for field, placeholder in (
+            (self.store_code_input, "e.g. ST-PUN"),
+            (self.store_name_input, "Enter the store display name"),
+            (self.address_input, "Street, area, and landmark"),
+            (self.city_input, "Primary operating city"),
+            (self.manager_name_input, "Store manager or primary lead"),
+            (self.contact_info_input, "Front desk phone or shared email"),
+            (self.owner_name_input, "Owner full name"),
+            (self.owner_mobile_input, "Primary mobile number"),
+            (self.owner_email_input, "owner@company.com"),
+            (self.store_admin_full_name_input, "Store admin full name"),
+            (self.store_admin_username_input, "Unique username for login"),
+            (self.store_admin_mobile_input, "Admin mobile number"),
+            (self.store_admin_email_input, "admin@store.com"),
+        ):
+            self._configure_text_input(field, placeholder=placeholder)
+        for field in (self.created_on_input, self.updated_on_input, self.store_admin_role_input):
+            self._configure_text_input(field)
+
+        store_form = self._create_form_layout()
+        store_form.addRow(self._create_form_label("Store code"), self.store_code_input)
+        store_form.addRow(self._create_form_label("Store name"), self.store_name_input)
+        store_form.addRow(self._create_form_label("Address"), self.address_input)
+        store_form.addRow(self._create_form_label("City"), self.city_input)
+        store_form.addRow(self._create_form_label("Manager"), self.manager_name_input)
+        store_form.addRow(self._create_form_label("Store contact"), self.contact_info_input)
+        store_form.addRow(self._create_form_label("Status"), self.status_combo)
+
+        owner_form = self._create_form_layout()
+        owner_form.addRow(self._create_form_label("Owner name"), self.owner_name_input)
+        owner_form.addRow(self._create_form_label("Owner mobile"), self.owner_mobile_input)
+        owner_form.addRow(self._create_form_label("Owner email"), self.owner_email_input)
+
+        self.store_admin_note_label = QLabel("")
+        self.store_admin_note_label.setWordWrap(True)
+        self.store_admin_note_label.setObjectName("InlineNote")
+        admin_form = self._create_form_layout()
+        admin_form.addRow(self._create_form_label("Admin role"), self.store_admin_role_input)
+        admin_form.addRow(self._create_form_label("Admin name"), self.store_admin_full_name_input)
+        admin_form.addRow(self._create_form_label("Admin username"), self.store_admin_username_input)
+        admin_form.addRow(self._create_form_label("Admin mobile"), self.store_admin_mobile_input)
+        admin_form.addRow(self._create_form_label("Admin email"), self.store_admin_email_input)
+        admin_form_widget = QWidget()
+        admin_form_widget.setLayout(admin_form)
+        admin_panel = QWidget()
+        admin_panel_layout = QVBoxLayout(admin_panel)
+        admin_panel_layout.setContentsMargins(0, 0, 0, 0)
+        admin_panel_layout.setSpacing(12)
+        admin_panel_layout.addWidget(self.store_admin_note_label)
+        admin_panel_layout.addWidget(admin_form_widget)
+
+        metadata_form = self._create_form_layout()
+        metadata_form.addRow(self._create_form_label("Created on"), self.created_on_input)
+        metadata_form.addRow(self._create_form_label("Last updated"), self.updated_on_input)
 
         self.feedback_label = QLabel("")
         self.feedback_label.setWordWrap(True)
-        self.feedback_label.setStyleSheet(
-            "background-color: #fffaeb; color: #8b5a2b; border: 1px solid #e6d7c5; "
-            "border-radius: 10px; padding: 8px 10px;"
-        )
+        self.feedback_label.setObjectName("FeedbackBanner")
         self.feedback_label.hide()
 
         root.addLayout(header_row)
-        root.addLayout(form)
+        cards_grid.addWidget(
+            self._create_section_card(
+                title="Store Profile",
+                copy="Operational identity, location, manager assignment, and the main store contact used by the team.",
+                content=self._wrap_form(store_form),
+            ),
+            0,
+            0,
+        )
+        cards_grid.addWidget(
+            self._create_section_card(
+                title="Store Owner",
+                copy="Owner details used for approvals, escalation paths, and direct communication.",
+                content=self._wrap_form(owner_form),
+            ),
+            0,
+            1,
+        )
+        cards_grid.addWidget(
+            self._create_section_card(
+                title="Store Admin User",
+                copy="Primary administrator account linked to this store. This user manages the store after provisioning.",
+                content=admin_panel,
+            ),
+            1,
+            0,
+        )
+        cards_grid.addWidget(
+            self._create_section_card(
+                title="Record Metadata",
+                copy="System-managed timestamps for the store record. These fields update automatically.",
+                content=self._wrap_form(metadata_form),
+            ),
+            1,
+            1,
+        )
+        scroll_layout.addLayout(cards_grid)
+        scroll_layout.addStretch(1)
+        scroll_area.setWidget(scroll_content)
+        root.addWidget(scroll_area, stretch=1)
         root.addWidget(self.feedback_label)
-        root.addStretch(1)
-
-        values = initial_values or {}
-        self.store_code_input.setText(values.get("store_code", ""))
-        self.store_name_input.setText(values.get("store_name", ""))
-        self.city_input.setText(values.get("city", ""))
-        self.manager_name_input.setText(values.get("manager_name", ""))
-        self.contact_info_input.setText(values.get("contact_info", ""))
-        initial_status = values.get("status", "Active")
+        self.store_code_input.setText(str(values.get("store_code", "")))
+        self.store_name_input.setText(str(values.get("store_name", "")))
+        self.address_input.setText(str(values.get("address", "")))
+        self.city_input.setText(str(values.get("city", "")))
+        self.manager_name_input.setText(str(values.get("manager_name", "")))
+        self.contact_info_input.setText(str(values.get("contact_info", "")))
+        self.owner_name_input.setText(str(values.get("owner_name", "")))
+        self.owner_mobile_input.setText(str(values.get("owner_mobile", "")))
+        self.owner_email_input.setText(str(values.get("owner_email", "")))
+        self.store_admin_full_name_input.setText(str(values.get("store_admin_full_name", "")))
+        self.store_admin_username_input.setText(str(values.get("store_admin_username", "")))
+        self.store_admin_mobile_input.setText(str(values.get("store_admin_mobile", "")))
+        self.store_admin_email_input.setText(str(values.get("store_admin_email", "")))
+        initial_status = str(values.get("status", "Active"))
         if initial_status not in self._store_status_options:
             initial_status = "Active"
         self.status_combo.setCurrentText(initial_status)
-        self.created_on_input.setText(values.get("created_on", "Set automatically when the store is created"))
-        self.updated_on_input.setText(values.get("updated_on", "Updated automatically after save"))
+        self.created_on_input.setText(
+            str(values.get("created_on", "Set automatically when the store is created"))
+        )
+        self.updated_on_input.setText(
+            str(values.get("updated_on", "Updated automatically after save"))
+        )
+        if self._existing_store_admin_user_id:
+            self.store_admin_username_input.setReadOnly(True)
+            self.store_admin_username_input.setClearButtonEnabled(False)
+            self.store_admin_note_label.setText(
+                "This store is already linked to an Admin user. Username stays fixed here; update the remaining contact details as needed."
+            )
+        else:
+            self.store_admin_note_label.setText(
+                "Creating the store will also create an Admin user for that store. The default password follows @ct<username>123456789 and the first sign-in will force a reset."
+            )
 
         cancel_button.clicked.connect(self.reject)
         submit_button.clicked.connect(self._submit)
+
+    def _configure_text_input(self, field: QLineEdit, *, placeholder: str = "") -> None:
+        field.setMinimumHeight(44)
+        field.setClearButtonEnabled(not field.isReadOnly())
+        if placeholder:
+            field.setPlaceholderText(placeholder)
+
+    def _create_form_layout(self) -> QFormLayout:
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(14)
+        return form
+
+    def _create_form_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("FieldLabel")
+        label.setMinimumWidth(132)
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        return label
+
+    def _wrap_form(self, form: QFormLayout) -> QWidget:
+        container = QWidget()
+        container.setLayout(form)
+        return container
+
+    def _create_section_card(self, *, title: str, copy: str, content: QWidget) -> QFrame:
+        card = QFrame()
+        card.setObjectName("EditorCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 18, 20, 20)
+        layout.setSpacing(14)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("SectionTitle")
+        copy_label = QLabel(copy)
+        copy_label.setObjectName("SectionCopy")
+        copy_label.setWordWrap(True)
+
+        layout.addWidget(title_label)
+        layout.addWidget(copy_label)
+        layout.addWidget(content)
+        layout.addStretch(1)
+        return card
 
     def _submit(self) -> None:
         payload = {
             "store_code": self.store_code_input.text().strip(),
             "store_name": self.store_name_input.text().strip(),
+            "address": self.address_input.text().strip(),
             "city": self.city_input.text().strip(),
             "manager_name": self.manager_name_input.text().strip(),
             "contact_info": self.contact_info_input.text().strip(),
+            "owner_name": self.owner_name_input.text().strip(),
+            "owner_mobile": self.owner_mobile_input.text().strip(),
+            "owner_email": self.owner_email_input.text().strip(),
             "status": self.status_combo.currentText(),
+            "store_admin_full_name": self.store_admin_full_name_input.text().strip(),
+            "store_admin_username": self.store_admin_username_input.text().strip(),
+            "store_admin_mobile": self.store_admin_mobile_input.text().strip(),
+            "store_admin_email": self.store_admin_email_input.text().strip(),
         }
         try:
             self._on_submit(payload)
@@ -1699,40 +1938,79 @@ class SuperadminDashboardScreen(QWidget):
 
         def handle_submit(payload: dict[str, object]) -> None:
             if record is None:
-                created_store_id = self._user_management_service.create_store(
+                result = self._user_management_service.create_store_with_admin(
                     store_code=str(payload["store_code"]),
                     store_name=str(payload["store_name"]),
+                    address=str(payload["address"]),
                     city=str(payload["city"]),
                     manager_name=str(payload["manager_name"]),
                     contact_info=str(payload["contact_info"]),
+                    owner_name=str(payload["owner_name"]),
+                    owner_mobile=str(payload["owner_mobile"]),
+                    owner_email=str(payload["owner_email"]),
                     status=str(payload["status"]),
+                    store_admin_username=str(payload["store_admin_username"]),
+                    store_admin_full_name=str(payload["store_admin_full_name"]),
+                    store_admin_mobile=str(payload["store_admin_mobile"]),
+                    store_admin_email=str(payload["store_admin_email"]),
                 )
                 if self._on_admin_change is not None:
                     self._on_admin_change(
                         "create_store",
-                        f"{created_store_id}:{payload['store_code']}:{payload['store_name']}",
+                        f"{result.store_id}:{payload['store_code']}:{payload['store_name']}",
                     )
-                self.feedback_label.setText(
-                    f"Created store {payload['store_name']} ({payload['store_code']})."
+                    if result.store_admin_user_id and result.store_admin_username:
+                        self._on_admin_change(
+                            "create_store_admin_user",
+                            f"{result.store_admin_user_id}:{result.store_admin_username}:Admin",
+                        )
+                feedback_message = (
+                    f"Created store {payload['store_name']} ({payload['store_code']}). "
+                    f"Store admin {result.store_admin_username} was provisioned with temporary password "
+                    f"{result.temporary_password}."
                 )
             else:
-                self._user_management_service.update_store(
+                result = self._user_management_service.update_store_with_admin(
                     store_id=record.store_id,
                     store_code=str(payload["store_code"]),
                     store_name=str(payload["store_name"]),
+                    address=str(payload["address"]),
                     city=str(payload["city"]),
                     manager_name=str(payload["manager_name"]),
                     contact_info=str(payload["contact_info"]),
+                    owner_name=str(payload["owner_name"]),
+                    owner_mobile=str(payload["owner_mobile"]),
+                    owner_email=str(payload["owner_email"]),
                     status=str(payload["status"]),
+                    store_admin_username=str(payload["store_admin_username"]),
+                    store_admin_full_name=str(payload["store_admin_full_name"]),
+                    store_admin_mobile=str(payload["store_admin_mobile"]),
+                    store_admin_email=str(payload["store_admin_email"]),
                 )
                 if self._on_admin_change is not None:
                     self._on_admin_change(
                         "update_store",
                         f"{record.store_id}:{payload['store_code']}:{payload['store_name']}",
                     )
-                self.feedback_label.setText(
+                    if result.temporary_password and result.store_admin_user_id and result.store_admin_username:
+                        self._on_admin_change(
+                            "create_store_admin_user",
+                            f"{result.store_admin_user_id}:{result.store_admin_username}:Admin",
+                        )
+                    elif result.store_admin_user_id and result.store_admin_username:
+                        self._on_admin_change(
+                            "update_store_admin_user",
+                            f"{result.store_admin_user_id}:{result.store_admin_username}:Admin",
+                        )
+                feedback_message = (
                     f"Updated store {payload['store_name']} ({payload['store_code']})."
                 )
+                if result.temporary_password and result.store_admin_username:
+                    feedback_message += (
+                        f" A new store admin {result.store_admin_username} was created with temporary password "
+                        f"{result.temporary_password}."
+                    )
+            self.feedback_label.setText(feedback_message)
             self.refresh_data()
             if self._on_catalog_change is not None:
                 self._on_catalog_change()
@@ -1746,9 +2024,18 @@ class SuperadminDashboardScreen(QWidget):
                 else {
                     "store_code": record.store_code,
                     "store_name": record.store_name,
+                    "address": record.address,
                     "city": record.city,
                     "manager_name": record.manager_name,
                     "contact_info": record.contact_info,
+                    "owner_name": record.owner_name,
+                    "owner_mobile": record.owner_mobile,
+                    "owner_email": record.owner_email,
+                    "store_admin_user_id": record.store_admin_user_id or "",
+                    "store_admin_username": record.store_admin_username,
+                    "store_admin_full_name": record.store_admin_full_name,
+                    "store_admin_mobile": record.store_admin_mobile,
+                    "store_admin_email": record.store_admin_email,
                     "status": record.status,
                     "created_on": record.created_on.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
                     "updated_on": record.updated_on.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
@@ -2056,6 +2343,7 @@ class AccessControlWorkspace(QWidget):
         )
         self.overview_page = self._build_overview_page(audit_review_service)
         self.manage_users_page = ManageUsersScreen(
+            current_user_id=self._current_user_id,
             user_management_service=self._user_management_service,
             on_admin_change=self._record_admin_change,
             on_permission_change=self._record_permission_change,
@@ -2088,11 +2376,11 @@ class AccessControlWorkspace(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(12)
 
-        intro = QLabel(
+        self.overview_intro_label = QLabel(
             "Review user, role, permission, and audit information here before moving into focused admin subpages."
         )
-        intro.setWordWrap(True)
-        intro.setStyleSheet("color: #555;")
+        self.overview_intro_label.setWordWrap(True)
+        self.overview_intro_label.setStyleSheet("color: #555;")
 
         self.tabs = QTabWidget()
         self.users_overview_screen = self._build_user_screen()
@@ -2103,7 +2391,7 @@ class AccessControlWorkspace(QWidget):
         self.tabs.addTab(self.permissions_overview_screen, "Permissions")
         self.tabs.addTab(AuditReviewScreen(audit_review_service), "Audit")
 
-        root.addWidget(intro)
+        root.addWidget(self.overview_intro_label)
         root.addWidget(self.tabs)
         return page
 
@@ -2121,7 +2409,7 @@ class AccessControlWorkspace(QWidget):
 
     def _user_overview_rows(self) -> list[tuple[str, ...]]:
         rows: list[tuple[str, ...]] = []
-        for summary in self._user_management_service.list_users():
+        for summary in self._user_management_service.list_users(actor_user_id=self._current_user_id):
             profile = self._user_management_service.get_user_profile(summary.user_id)
             if profile is None:
                 continue
@@ -2162,6 +2450,7 @@ class AccessControlWorkspace(QWidget):
 
     def set_current_user_id(self, current_user_id: str | None) -> None:
         self._current_user_id = current_user_id
+        self.manage_users_page.set_current_user_id(current_user_id)
         self._refresh_section_availability(reset_active_section=True)
 
     def _record_admin_change(self, action: str, value: str) -> None:
@@ -2205,6 +2494,17 @@ class AccessControlWorkspace(QWidget):
             self.users_overview_screen.update_rows(self._user_overview_rows())
             self.roles_overview_screen.update_rows(self._role_overview_rows())
             self.permissions_overview_screen.update_rows(self._permission_overview_rows())
+            store_context = self._user_management_service.get_store_dashboard_context_for_user(
+                self._current_user_id
+            )
+            if store_context is None:
+                self.overview_intro_label.setText(
+                    "Review user, role, permission, and audit information here before moving into focused admin subpages."
+                )
+            else:
+                self.overview_intro_label.setText(
+                    f"This overview is scoped to {store_context.store_name}. User listings and assignment counts reflect this store only."
+                )
             self.subtitle.setText(
                 "Admin Console opens on the tabbed overview so users can review Users, Roles, Permissions, and Audit data first."
             )
@@ -2226,7 +2526,7 @@ class AccessControlWorkspace(QWidget):
 
     def _role_overview_rows(self) -> list[tuple[str, ...]]:
         assignment_counts: dict[str, int] = {}
-        for summary in self._user_management_service.list_users():
+        for summary in self._user_management_service.list_users(actor_user_id=self._current_user_id):
             profile = self._user_management_service.get_user_profile(summary.user_id)
             if profile is None:
                 continue
@@ -2268,6 +2568,7 @@ class AccessControlWorkspace(QWidget):
         return module, action, risk
 
     def _refresh_catalog_backed_views(self) -> None:
+        self.users_overview_screen.update_rows(self._user_overview_rows())
         self.manage_users_page.refresh_reference_data()
         self.roles_overview_screen.update_rows(self._role_overview_rows())
         self.permissions_overview_screen.update_rows(self._permission_overview_rows())
@@ -2284,7 +2585,13 @@ class AccessControlWorkspace(QWidget):
             self.settings_button.hide()
             self.section_nav_panel.hide()
         else:
-            self.heading.setText("Access Control Management")
+            store_context = self._user_management_service.get_store_dashboard_context_for_user(
+                self._current_user_id
+            )
+            if store_context is None:
+                self.heading.setText("Access Control Management")
+            else:
+                self.heading.setText(f"{store_context.store_name} Administration")
             self.heading.show()
             self.subtitle.show()
             self.dashboard_button.hide()

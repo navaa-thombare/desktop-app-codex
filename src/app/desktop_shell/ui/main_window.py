@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Callable
 from uuid import uuid4
 
 from PySide6.QtCore import QTimer, Qt
@@ -20,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.admin.services import AdminUserManagementService
+from app.admin.services import AdminStoreRecord, AdminUserManagementService, StoreDashboardContext
 from app.auth.dtos import AuthFailureCode, LoginRequest
 from app.auth.services import AuthService
 from app.authorization.services import (
@@ -49,6 +50,207 @@ class PendingPasswordReset:
     activate_workspace_on_success: bool = False
 
 
+class StoreProfileHomeScreen(QWidget):
+    def __init__(
+        self,
+        *,
+        user_management_service: AdminUserManagementService,
+        on_store_updated: Callable[[AdminStoreRecord], None] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._user_management_service = user_management_service
+        self._on_store_updated = on_store_updated
+        self._current_user_id: str | None = None
+        self._store_record: AdminStoreRecord | None = None
+        self._editable = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(16)
+
+        profile_card = QFrame()
+        profile_card.setObjectName("InnerCard")
+        profile_layout = QVBoxLayout(profile_card)
+        profile_layout.setContentsMargins(22, 22, 22, 22)
+        profile_layout.setSpacing(14)
+
+        title = QLabel("Store Information")
+        title.setObjectName("SectionTitle")
+        self.copy_label = QLabel(
+            "Only address and store contact information can be updated here."
+        )
+        self.copy_label.setObjectName("SectionCopy")
+        self.copy_label.setWordWrap(True)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(14)
+
+        self.store_name_input = self._build_readonly_input()
+        self.store_code_input = self._build_readonly_input()
+        self.city_input = self._build_readonly_input()
+        self.status_input = self._build_readonly_input()
+        self.address_input = QLineEdit()
+        self.address_input.setPlaceholderText("Store address")
+        self.contact_info_input = QLineEdit()
+        self.contact_info_input.setPlaceholderText("Store contact information")
+
+        form.addRow(self._form_label("Store name"), self.store_name_input)
+        form.addRow(self._form_label("Store code"), self.store_code_input)
+        form.addRow(self._form_label("City"), self.city_input)
+        form.addRow(self._form_label("Status"), self.status_input)
+        form.addRow(self._form_label("Address"), self.address_input)
+        form.addRow(self._form_label("Contact information"), self.contact_info_input)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setObjectName("SecondaryButton")
+        self.save_button = QPushButton("Save Store Details")
+        self.save_button.setObjectName("ActionButton")
+        self.save_button.setMinimumHeight(44)
+        actions.addWidget(self.cancel_button)
+        actions.addWidget(self.save_button)
+
+        self.feedback_label = QLabel("")
+        self.feedback_label.setObjectName("StatusMessage")
+        self.feedback_label.setWordWrap(True)
+        self.feedback_label.hide()
+
+        profile_layout.addWidget(title)
+        profile_layout.addWidget(self.copy_label)
+        profile_layout.addLayout(form)
+        profile_layout.addWidget(self.feedback_label)
+        profile_layout.addLayout(actions)
+
+        future_card = QFrame()
+        future_card.setObjectName("InnerCard")
+        future_layout = QVBoxLayout(future_card)
+        future_layout.setContentsMargins(22, 22, 22, 22)
+        future_layout.setSpacing(10)
+
+        future_title = QLabel("Reserved Space")
+        future_title.setObjectName("SectionTitle")
+        future_copy = QLabel(
+            "This area is intentionally left open for future store-specific enhancements."
+        )
+        future_copy.setObjectName("SectionCopy")
+        future_copy.setWordWrap(True)
+
+        future_layout.addWidget(future_title)
+        future_layout.addWidget(future_copy)
+        future_layout.addStretch(1)
+
+        root.addWidget(profile_card)
+        root.addWidget(future_card)
+        root.addStretch(1)
+
+        self.cancel_button.clicked.connect(self._restore_current_values)
+        self.save_button.clicked.connect(self._save_store_profile)
+        self.clear_context()
+
+    def set_store_context(
+        self,
+        *,
+        current_user_id: str | None,
+        store_record: AdminStoreRecord,
+        editable: bool,
+    ) -> None:
+        self._current_user_id = current_user_id
+        self._store_record = store_record
+        self._editable = editable
+        self._set_status("", tone="success")
+
+        self.store_name_input.setText(store_record.store_name)
+        self.store_code_input.setText(store_record.store_code)
+        self.city_input.setText(store_record.city)
+        self.status_input.setText(store_record.status)
+        self.address_input.setText(store_record.address)
+        self.contact_info_input.setText(store_record.contact_info)
+        self.address_input.setReadOnly(not editable)
+        self.contact_info_input.setReadOnly(not editable)
+        self.address_input.setClearButtonEnabled(editable)
+        self.contact_info_input.setClearButtonEnabled(editable)
+        self.cancel_button.setVisible(editable)
+        self.save_button.setVisible(editable)
+        self.copy_label.setText(
+            "Only address and store contact information can be updated here."
+            if editable
+            else "Store profile details are shown here for reference. This session cannot change them."
+        )
+
+    def clear_context(self) -> None:
+        self._current_user_id = None
+        self._store_record = None
+        self._editable = False
+        for widget in (
+            self.store_name_input,
+            self.store_code_input,
+            self.city_input,
+            self.status_input,
+            self.address_input,
+            self.contact_info_input,
+        ):
+            widget.clear()
+        self.address_input.setReadOnly(True)
+        self.contact_info_input.setReadOnly(True)
+        self.address_input.setClearButtonEnabled(False)
+        self.contact_info_input.setClearButtonEnabled(False)
+        self.cancel_button.hide()
+        self.save_button.hide()
+        self._set_status("", tone="success")
+
+    def _build_readonly_input(self) -> QLineEdit:
+        widget = QLineEdit()
+        widget.setReadOnly(True)
+        return widget
+
+    def _form_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("FormLabel")
+        return label
+
+    def _restore_current_values(self) -> None:
+        if self._store_record is None:
+            return
+        self.address_input.setText(self._store_record.address)
+        self.contact_info_input.setText(self._store_record.contact_info)
+        self._set_status("Reverted unsaved changes.", tone="success")
+
+    def _save_store_profile(self) -> None:
+        if self._store_record is None or not self._editable:
+            return
+
+        try:
+            updated_record = self._user_management_service.update_store_profile_for_user(
+                actor_user_id=self._current_user_id,
+                address=self.address_input.text(),
+                contact_info=self.contact_info_input.text(),
+            )
+        except ValueError as exc:
+            self._set_status(str(exc), tone="error")
+            return
+
+        self._store_record = updated_record
+        self.address_input.setText(updated_record.address)
+        self.contact_info_input.setText(updated_record.contact_info)
+        self._set_status("Store details updated successfully.", tone="success")
+        if self._on_store_updated is not None:
+            self._on_store_updated(updated_record)
+
+    def _set_status(self, message: str, *, tone: str) -> None:
+        self.feedback_label.setText(message)
+        self.feedback_label.setVisible(bool(message))
+        self.feedback_label.setProperty("tone", tone)
+        self.feedback_label.style().unpolish(self.feedback_label)
+        self.feedback_label.style().polish(self.feedback_label)
+        self.feedback_label.update()
+
+
 class MainWindow(QMainWindow):
     def __init__(
         self,
@@ -75,6 +277,7 @@ class MainWindow(QMainWindow):
         self._current_user_id: str | None = None
         self._session_state: SessionState | None = None
         self._pending_password_reset: PendingPasswordReset | None = None
+        self._store_dashboard_context: StoreDashboardContext | None = None
         self._is_loading = False
         self._active_route = "home"
 
@@ -576,6 +779,28 @@ class MainWindow(QMainWindow):
         sidebar_heading.setObjectName("SidebarHeading")
         sidebar_layout.addWidget(sidebar_heading)
 
+        self.sidebar_store_card = QFrame()
+        self.sidebar_store_card.setObjectName("InnerCard")
+        sidebar_store_layout = QVBoxLayout(self.sidebar_store_card)
+        sidebar_store_layout.setContentsMargins(16, 16, 16, 16)
+        sidebar_store_layout.setSpacing(6)
+
+        self.sidebar_store_title = QLabel("Global Workspace")
+        self.sidebar_store_title.setObjectName("SectionTitle")
+        self.sidebar_store_location_label = QLabel(
+            "Sign in to load the active store identity for this session."
+        )
+        self.sidebar_store_location_label.setObjectName("SectionCopy")
+        self.sidebar_store_location_label.setWordWrap(True)
+        self.sidebar_store_contact_label = QLabel("")
+        self.sidebar_store_contact_label.setObjectName("SectionCopy")
+        self.sidebar_store_contact_label.setWordWrap(True)
+
+        sidebar_store_layout.addWidget(self.sidebar_store_title)
+        sidebar_store_layout.addWidget(self.sidebar_store_location_label)
+        sidebar_store_layout.addWidget(self.sidebar_store_contact_label)
+        sidebar_layout.addWidget(self.sidebar_store_card)
+
         self.nav_home_button = QPushButton("Home")
         self.nav_admin_button = QPushButton("Admin Console")
         self.nav_billing_button = QPushButton("Billing")
@@ -669,7 +894,25 @@ class MainWindow(QMainWindow):
         page = QWidget(self)
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
+        layout.setSpacing(0)
+
+        self.home_mode_stack = QStackedWidget()
+
+        self.superadmin_home_page = QWidget()
+        superadmin_layout = QVBoxLayout(self.superadmin_home_page)
+        superadmin_layout.setContentsMargins(0, 0, 0, 0)
+        superadmin_layout.addStretch(1)
+
+        self.store_home_page = StoreProfileHomeScreen(
+            user_management_service=self._admin_user_management_service,
+            on_store_updated=self._handle_store_profile_updated,
+            parent=self,
+        )
+
+        self.default_home_page = QWidget()
+        default_layout = QVBoxLayout(self.default_home_page)
+        default_layout.setContentsMargins(0, 0, 0, 0)
+        default_layout.setSpacing(16)
 
         report_card = QFrame()
         report_card.setObjectName("InnerCard")
@@ -694,6 +937,27 @@ class MainWindow(QMainWindow):
         report_layout.addWidget(report_copy)
         report_layout.addWidget(self.report_button, alignment=Qt.AlignmentFlag.AlignLeft)
 
+        store_card = QFrame()
+        store_card.setObjectName("InnerCard")
+        store_layout = QVBoxLayout(store_card)
+        store_layout.setContentsMargins(20, 20, 20, 20)
+        store_layout.setSpacing(10)
+
+        store_title = QLabel("Store Dashboard")
+        store_title.setObjectName("SectionTitle")
+        self.home_store_summary_label = QLabel(
+            "Sign in with a store user to load the current store identity and scoped team summary."
+        )
+        self.home_store_summary_label.setObjectName("SectionCopy")
+        self.home_store_summary_label.setWordWrap(True)
+        self.home_store_details_label = QLabel("")
+        self.home_store_details_label.setObjectName("SectionCopy")
+        self.home_store_details_label.setWordWrap(True)
+
+        store_layout.addWidget(store_title)
+        store_layout.addWidget(self.home_store_summary_label)
+        store_layout.addWidget(self.home_store_details_label)
+
         session_card = QFrame()
         session_card.setObjectName("InnerCard")
         session_layout = QVBoxLayout(session_card)
@@ -711,9 +975,15 @@ class MainWindow(QMainWindow):
         session_layout.addWidget(session_title)
         session_layout.addWidget(self.home_session_label)
 
-        layout.addWidget(report_card)
-        layout.addWidget(session_card)
-        layout.addStretch(1)
+        default_layout.addWidget(report_card)
+        default_layout.addWidget(store_card)
+        default_layout.addWidget(session_card)
+        default_layout.addStretch(1)
+
+        self.home_mode_stack.addWidget(self.superadmin_home_page)
+        self.home_mode_stack.addWidget(self.store_home_page)
+        self.home_mode_stack.addWidget(self.default_home_page)
+        layout.addWidget(self.home_mode_stack)
         return page
 
     def _build_billing_page(self) -> QWidget:
@@ -935,22 +1205,15 @@ class MainWindow(QMainWindow):
             expires_at=expires_at,
             password_reset_required=password_reset_required,
         )
+        self._store_dashboard_context = (
+            self._admin_user_management_service.get_store_dashboard_context_for_user(
+                self._current_user_id
+            )
+        )
 
         expiry = expires_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        self.workspace_heading.setText(f"{self._app_name} Workspace")
-        self.workspace_summary_label.setText(
-            f"Signed in as {identifier}. Session expires at {expiry}."
-        )
-        self.session_badge_label.setText(
-            f"User ID: {self._current_user_id}\n"
-            f"Identity: {identifier}\n"
-            f"Expiry: {expiry}"
-        )
-        self.home_session_label.setText(
-            f"Current user: {identifier}\n"
-            f"User ID: {self._current_user_id}\n"
-            f"Session expiry: {expiry}"
-        )
+        self._refresh_store_scoped_shell(identifier=identifier, expiry=expiry)
+        self._refresh_home_route_content()
         if password_reset_required:
             self._set_status_label(
                 self.workspace_notice,
@@ -969,7 +1232,7 @@ class MainWindow(QMainWindow):
         if self._current_user_id is None:
             return
 
-        self._sync_admin_route_presentation()
+        self._sync_route_presentation()
         context = self._authorization_service.build_context(self._current_user_id)
         nav_checks = {
             "home": "nav:home",
@@ -990,6 +1253,12 @@ class MainWindow(QMainWindow):
         )
 
     def _default_route_key(self) -> str:
+        if (
+            self._current_user_id is not None
+            and self._admin_user_management_service.role_name_for_user(self._current_user_id) == "Superadmin"
+            and self._nav_buttons["admin"].isEnabled()
+        ):
+            return "admin"
         for route_key in ("home", "admin", "billing"):
             if self._nav_buttons[route_key].isEnabled():
                 return route_key
@@ -1036,6 +1305,7 @@ class MainWindow(QMainWindow):
         self._current_user_id = None
         self._session_state = None
         self._pending_password_reset = None
+        self._store_dashboard_context = None
         self.admin_page.set_current_user_id(None)
         self.identifier_input.clear()
         self.password_input.clear()
@@ -1053,12 +1323,24 @@ class MainWindow(QMainWindow):
         )
 
     def _reset_workspace_state(self) -> None:
-        self._sync_admin_route_presentation()
+        self._store_dashboard_context = None
+        self._sync_route_presentation()
         self.workspace_heading.setText("Secure workspace")
         self.workspace_summary_label.setText(
             "Sign in to unlock navigation and protected actions."
         )
         self.session_badge_label.setText("No active session")
+        self.sidebar_store_title.setText("Global Workspace")
+        self.sidebar_store_location_label.setText(
+            "Sign in to load the active store identity for this session."
+        )
+        self.sidebar_store_contact_label.setText("")
+        self.home_store_summary_label.setText(
+            "Sign in with a store user to load the current store identity and scoped team summary."
+        )
+        self.home_store_details_label.setText("")
+        self.store_home_page.clear_context()
+        self.home_mode_stack.setCurrentWidget(self.default_home_page)
         self.home_session_label.setText(
             "Sign in to populate session metadata and route-aware workspace details."
         )
@@ -1107,7 +1389,7 @@ class MainWindow(QMainWindow):
         self.route_stack.removeWidget(previous_admin_page)
         previous_admin_page.deleteLater()
 
-        self._sync_admin_route_presentation()
+        self._sync_route_presentation()
         self._render_authorized_navigation()
         self._navigate(previous_route, clear_notice=False)
         self._set_status_label(
@@ -1116,21 +1398,144 @@ class MainWindow(QMainWindow):
             tone="success",
         )
 
-    def _sync_admin_route_presentation(self) -> None:
+    def _sync_route_presentation(self) -> None:
         is_superadmin = (
             self._current_user_id is not None
             and self._admin_user_management_service.role_name_for_user(self._current_user_id) == "Superadmin"
         )
+        has_store_scope = self._store_dashboard_context is not None
+        if is_superadmin:
+            self.nav_home_button.setText("Home")
+            self._route_config["home"]["title"] = "Home"
+            self._route_config["home"]["subtitle"] = ""
+        elif has_store_scope:
+            self.nav_home_button.setText("Store Dashboard")
+            self._route_config["home"]["title"] = "Store Dashboard"
+            self._route_config["home"]["subtitle"] = (
+                "Review store information and keep address and contact details up to date."
+            )
+        else:
+            self.nav_home_button.setText("Home")
+            self._route_config["home"]["title"] = "Home"
+            self._route_config["home"]["subtitle"] = (
+                "Review the active session and run permissioned operational tasks."
+            )
         if is_superadmin:
             self.nav_admin_button.setText("Superadmin Dashboard")
             self._route_config["admin"]["title"] = "Superadmin Dashboard"
             self._route_config["admin"]["subtitle"] = ""
+            self._refresh_home_route_content()
             return
 
         self.nav_admin_button.setText("Admin Console")
         self._route_config["admin"]["title"] = "Admin Console"
         self._route_config["admin"]["subtitle"] = (
             "Manage users, roles, permissions, and audit review in the same workspace."
+        )
+        self._refresh_home_route_content()
+
+    def _refresh_store_scoped_shell(self, *, identifier: str, expiry: str) -> None:
+        store_context = self._store_dashboard_context
+        if store_context is None:
+            self.workspace_heading.setText(f"{self._app_name} Workspace")
+            self.workspace_summary_label.setText(
+                f"Signed in as {identifier}. Session expires at {expiry}."
+            )
+            self.session_badge_label.setText(
+                f"User ID: {self._current_user_id}\n"
+                f"Identity: {identifier}\n"
+                f"Expiry: {expiry}"
+            )
+            self.home_store_summary_label.setText(
+                "This account is not linked to a specific store. Global workspace routes remain available based on permissions."
+            )
+            self.home_store_details_label.setText("")
+            self.home_session_label.setText(
+                f"Current user: {identifier}\n"
+                f"User ID: {self._current_user_id}\n"
+                f"Session expiry: {expiry}"
+            )
+            self.sidebar_store_title.setText("Global Workspace")
+            self.sidebar_store_location_label.setText(
+                "This session is not tied to a store record."
+            )
+            self.sidebar_store_contact_label.setText("")
+            return
+
+        location_line = store_context.address or store_context.city
+        self.workspace_heading.setText(store_context.store_name)
+        self.workspace_summary_label.setText(
+            f"{location_line} | {store_context.contact_info}\n"
+            f"Signed in as {identifier}. Session expires at {expiry}."
+        )
+        self.session_badge_label.setText(
+            f"Store: {store_context.store_name} ({store_context.store_code})\n"
+            f"Identity: {identifier}\n"
+            f"Expiry: {expiry}"
+        )
+        self.home_store_summary_label.setText(
+            f"{store_context.store_name} is the active store for this session. "
+            f"{store_context.user_count} store user(s) are currently assigned to this location."
+        )
+        self.home_store_details_label.setText(
+            f"Address: {location_line}\n"
+            f"Contact: {store_context.contact_info}\n"
+            f"Owner: {store_context.owner_name or 'Not set'}\n"
+            f"Status: {store_context.status}"
+        )
+        self.home_session_label.setText(
+            f"Current store: {store_context.store_name}\n"
+            f"Store code: {store_context.store_code}\n"
+            f"Current user: {identifier}\n"
+            f"Session expiry: {expiry}"
+        )
+        self.sidebar_store_title.setText(store_context.store_name)
+        self.sidebar_store_location_label.setText(location_line)
+        self.sidebar_store_contact_label.setText(store_context.contact_info)
+
+    def _refresh_home_route_content(self) -> None:
+        is_superadmin = (
+            self._current_user_id is not None
+            and self._admin_user_management_service.role_name_for_user(self._current_user_id) == "Superadmin"
+        )
+        if is_superadmin:
+            self.store_home_page.clear_context()
+            self.home_mode_stack.setCurrentWidget(self.superadmin_home_page)
+            return
+
+        if self._store_dashboard_context is not None:
+            store_record = self._admin_user_management_service.get_store_for_user(self._current_user_id)
+            if store_record is not None:
+                editable = (
+                    self._admin_user_management_service.role_name_for_user(self._current_user_id) == "Admin"
+                )
+                self.store_home_page.set_store_context(
+                    current_user_id=self._current_user_id,
+                    store_record=store_record,
+                    editable=editable,
+                )
+                self.home_mode_stack.setCurrentWidget(self.store_home_page)
+                return
+
+        self.store_home_page.clear_context()
+        self.home_mode_stack.setCurrentWidget(self.default_home_page)
+
+    def _handle_store_profile_updated(self, updated_record: AdminStoreRecord) -> None:
+        if self._current_user_id is None or self._session_state is None:
+            return
+
+        self._store_dashboard_context = (
+            self._admin_user_management_service.get_store_dashboard_context_for_user(
+                self._current_user_id
+            )
+        )
+        expiry = self._session_state.expires_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        self._refresh_store_scoped_shell(identifier=self._session_state.identifier, expiry=expiry)
+        self._refresh_home_route_content()
+        self._set_status_label(
+            self.workspace_notice,
+            f"Updated store profile for {updated_record.store_name}.",
+            tone="success",
         )
 
     def _set_loading(self, is_loading: bool) -> None:

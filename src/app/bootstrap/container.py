@@ -21,6 +21,7 @@ from app.authorization.services import (
     EffectivePermissionService,
     ReportingService,
 )
+from app.operations.services import OperationsService
 from app.platform.audit.in_memory import InMemoryAuditEventRepository
 from app.platform.audit.services import AuditReviewService, AuditService
 from app.platform.config.settings import AppSettings
@@ -41,6 +42,7 @@ class Container:
     audit_service: AuditService
     audit_review_service: AuditReviewService
     admin_user_management_service: AdminUserManagementService
+    operations_service: OperationsService
 
 
 def build_container(settings: AppSettings) -> Container:
@@ -57,6 +59,10 @@ def build_container(settings: AppSettings) -> Container:
         session_factory=session_factory,
         password_hasher=password_manager.hash,
         bootstrap_password="ChangeMe123!",
+    )
+    operations_service = OperationsService(
+        engine=engine,
+        session_factory=session_factory,
     )
     user_repository = SqlUserRepository(session_factory=session_factory)
 
@@ -93,4 +99,5 @@ def build_container(settings: AppSettings) -> Container:
         audit_service=audit_service,
         audit_review_service=audit_review_service,
         admin_user_management_service=admin_user_management_service,
+        operations_service=operations_service,
     )

@@ -2374,25 +2374,22 @@ class AccessControlWorkspace(QWidget):
         page = QWidget(self)
         root = QVBoxLayout(page)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(12)
-
-        self.overview_intro_label = QLabel(
-            "Review user, role, permission, and audit information here before moving into focused admin subpages."
+        root.setSpacing(0)
+        coming_soon_label = QLabel("comming soon.......")
+        coming_soon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        coming_soon_label.setStyleSheet(
+            "font-size: 24px; font-weight: 700; color: #6a645d; letter-spacing: 0.5px;"
         )
-        self.overview_intro_label.setWordWrap(True)
-        self.overview_intro_label.setStyleSheet("color: #555;")
-
+        self.overview_intro_label = QLabel("")
+        self.overview_intro_label.hide()
         self.tabs = QTabWidget()
+        self.tabs.hide()
         self.users_overview_screen = self._build_user_screen()
         self.roles_overview_screen = self._build_role_screen()
         self.permissions_overview_screen = self._build_permission_screen()
-        self.tabs.addTab(self.users_overview_screen, "Users")
-        self.tabs.addTab(self.roles_overview_screen, "Roles")
-        self.tabs.addTab(self.permissions_overview_screen, "Permissions")
-        self.tabs.addTab(AuditReviewScreen(audit_review_service), "Audit")
-
-        root.addWidget(self.overview_intro_label)
-        root.addWidget(self.tabs)
+        root.addStretch(1)
+        root.addWidget(coming_soon_label)
+        root.addStretch(1)
         return page
 
     def _build_user_screen(self) -> QWidget:
@@ -2473,10 +2470,10 @@ class AccessControlWorkspace(QWidget):
 
     def _show_section(self, section_key: str) -> None:
         is_superadmin = self._user_management_service.role_name_for_user(self._current_user_id) == "Superadmin"
-        if is_superadmin:
-            section_key = "dashboard"
-        elif section_key == "dashboard":
+        if not is_superadmin:
             section_key = "overview"
+        else:
+            section_key = "dashboard"
 
         for key, button in self._section_buttons.items():
             if button.isVisible():
@@ -2488,26 +2485,11 @@ class AccessControlWorkspace(QWidget):
                 "Superadmin dashboard exposes Store Management and Role Management in one horizontal control surface."
             )
             self.section_stack.setCurrentWidget(self.dashboard_page)
+            self._update_section_chrome(section_key)
             return
 
         if section_key == "overview":
-            self.users_overview_screen.update_rows(self._user_overview_rows())
-            self.roles_overview_screen.update_rows(self._role_overview_rows())
-            self.permissions_overview_screen.update_rows(self._permission_overview_rows())
-            store_context = self._user_management_service.get_store_dashboard_context_for_user(
-                self._current_user_id
-            )
-            if store_context is None:
-                self.overview_intro_label.setText(
-                    "Review user, role, permission, and audit information here before moving into focused admin subpages."
-                )
-            else:
-                self.overview_intro_label.setText(
-                    f"This overview is scoped to {store_context.store_name}. User listings and assignment counts reflect this store only."
-                )
-            self.subtitle.setText(
-                "Admin Console opens on the tabbed overview so users can review Users, Roles, Permissions, and Audit data first."
-            )
+            self._update_section_chrome(section_key)
             self.section_stack.setCurrentWidget(self.overview_page)
             return
 
@@ -2517,12 +2499,25 @@ class AccessControlWorkspace(QWidget):
                 "Select a user by name, edit roles and permissions, activate or deactivate the account, reset the default password, and review day-by-day activity."
             )
             self.section_stack.setCurrentWidget(self.manage_users_page)
+            self._update_section_chrome(section_key)
             return
 
         self.subtitle.setText(
             "Maintain session, password, lockout, and audit retention settings for the admin area."
         )
         self.section_stack.setCurrentWidget(self.settings_page)
+        self._update_section_chrome(section_key)
+
+    def _update_section_chrome(self, section_key: str) -> None:
+        is_superadmin = self._user_management_service.role_name_for_user(self._current_user_id) == "Superadmin"
+        if is_superadmin:
+            self.heading.hide()
+            self.subtitle.hide()
+            return
+
+        overview_mode = section_key == "overview"
+        self.heading.setVisible(not overview_mode)
+        self.subtitle.setVisible(not overview_mode and bool(self.subtitle.text()))
 
     def _role_overview_rows(self) -> list[tuple[str, ...]]:
         assignment_counts: dict[str, int] = {}
@@ -2559,7 +2554,7 @@ class AccessControlWorkspace(QWidget):
         permission_lower = permission_name.lower()
         if any(token in permission_lower for token in ("delete", "assign", "superadmin")):
             risk = "Critical"
-        elif any(token in permission_lower for token in ("create", "update", "edit", "refund")):
+        elif any(token in permission_lower for token in ("create", "update", "edit", "refund", "activate", "deactivate", "add", "remove")):
             risk = "High"
         elif any(token in permission_lower for token in ("view", "read", "status")):
             risk = "Low"
@@ -2589,16 +2584,17 @@ class AccessControlWorkspace(QWidget):
                 self._current_user_id
             )
             if store_context is None:
-                self.heading.setText("Access Control Management")
+                self.heading.setText("Admin Console")
             else:
-                self.heading.setText(f"{store_context.store_name} Administration")
-            self.heading.show()
-            self.subtitle.show()
+                self.heading.setText(f"{store_context.store_name} Admin Console")
+            self.subtitle.setText("")
+            self.heading.hide()
+            self.subtitle.hide()
             self.dashboard_button.hide()
-            self.overview_button.show()
-            self.manage_users_button.show()
-            self.settings_button.show()
-            self.section_nav_panel.show()
+            self.overview_button.hide()
+            self.manage_users_button.hide()
+            self.settings_button.hide()
+            self.section_nav_panel.hide()
 
         if reset_active_section:
             self._show_section("dashboard" if is_superadmin else "overview")

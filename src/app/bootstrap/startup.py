@@ -42,6 +42,7 @@ def start_application(settings: AppSettings | None = None) -> int:
         container.audit_service,
         container.audit_review_service,
         container.admin_user_management_service,
+        container.operations_service,
         app_env=container.settings.app_env,
     )
     window.show()

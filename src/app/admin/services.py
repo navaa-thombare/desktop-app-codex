@@ -22,6 +22,9 @@ class ManagedUserModel(Base):
     full_name: Mapped[str] = mapped_column(String(150), nullable=False)
     contact_info: Mapped[str] = mapped_column(String(200), nullable=False)
     store_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    speciality: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    joining_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by_user_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
     created_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     roles: Mapped[list["ManagedUserRoleModel"]] = relationship(
@@ -155,6 +158,38 @@ class AdminUserProfile:
 
 
 @dataclass(frozen=True)
+class StoreStaffRow:
+    user_id: str
+    full_name: str
+    contact_number: str
+    speciality: str
+    joining_date: datetime
+    role_name: str
+    username: str
+    created_by_name: str
+
+
+@dataclass(frozen=True)
+class StaffMemberProfile:
+    user_id: str | None
+    full_name: str
+    contact_number: str
+    speciality: str
+    joining_date: datetime
+    role_name: str
+    username: str
+    created_by_user_id: str | None
+    created_by_name: str
+
+
+@dataclass(frozen=True)
+class StaffMemberSaveResult:
+    user_id: str
+    username: str
+    temporary_password: str | None = None
+
+
+@dataclass(frozen=True)
 class AdminStoreRecord:
     store_id: str
     store_code: str
@@ -223,10 +258,26 @@ class AdminUserManagementService:
             "nav:admin",
             "nav:operations",
             "report:run",
+            "store:view",
+            "store:create",
+            "store:update",
+            "store:activate",
+            "store:deactivate",
             "user:view",
             "user:create:admin",
+            "user:create:store_admin",
             "user:create:staff",
             "user:edit",
+            "user:update:store_admin",
+            "user:delete:store_admin",
+            "user:activate:store_admin",
+            "user:deactivate:store_admin",
+            "role:view",
+            "role:create",
+            "role:update",
+            "permission:view",
+            "permission:add",
+            "permission:remove",
             "customer:create",
             "customer:update",
             "order:view",
@@ -314,7 +365,7 @@ class AdminUserManagementService:
         "Worker": "Operations",
     }
     ROLE_DESCRIPTION_MAP = {
-        "Superadmin": "Full application control, including store and role administration.",
+        "Superadmin": "Full application control, including store lifecycle management, store-admin management, role creation, and permission administration.",
         "Admin": "Manages non-superadmin users and administrative workflows.",
         "Manager": "Handles customers, orders, billing updates, and fulfillment changes.",
         "Worker": "Reads order details and updates in-progress operational statuses.",
@@ -342,6 +393,7 @@ class AdminUserManagementService:
         self._backfill_store_metadata()
         self._backfill_store_user_assignments()
         self._ensure_auth_records()
+        self._backfill_staff_metadata()
 
     def list_users(
         self,
@@ -916,6 +968,227 @@ class AdminUserManagementService:
             return None
         return self.get_store(store_id)
 
+    def display_name_for_user(self, user_id: str | None) -> str:
+        if user_id is None:
+            return ""
+        with self._session_factory() as session:
+            user = session.get(ManagedUserModel, user_id)
+            return user.full_name if user is not None else ""
+
+    def list_store_staff(
+        self,
+        *,
+        actor_user_id: str | None,
+        created_by_actor_only: bool = False,
+    ) -> tuple[StoreStaffRow, ...]:
+        store_id = self.store_id_for_user(actor_user_id)
+        if store_id is None:
+            return ()
+
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(ManagedUserModel)
+                .where(ManagedUserModel.store_id == store_id)
+                .order_by(ManagedUserModel.full_name.asc())
+            ).all()
+            actor_role = self.role_name_for_user(actor_user_id)
+            allowed_roles = set(self.available_roles_for_actor(actor_user_id))
+            creator_lookup = {
+                user.user_id: user.full_name
+                for user in session.scalars(select(ManagedUserModel)).all()
+            }
+            return tuple(
+                StoreStaffRow(
+                    user_id=row.user_id,
+                    full_name=row.full_name,
+                    contact_number=self._contact_number_for_user(row),
+                    speciality=(row.speciality or "").strip(),
+                    joining_date=self._ensure_utc(row.joining_date or row.created_on),
+                    role_name=self._normalized_role_for_existing_user(row),
+                    username=row.username,
+                    created_by_name=creator_lookup.get(row.created_by_user_id or "", ""),
+                )
+                for row in rows
+                if (
+                    (actor_role == "Superadmin" or row.user_id != actor_user_id)
+                    and (
+                        actor_role == "Superadmin"
+                        or self._normalized_role_for_existing_user(row) in allowed_roles
+                    )
+                    and (
+                        not created_by_actor_only
+                        or actor_user_id is None
+                        or row.created_by_user_id == actor_user_id
+                    )
+                )
+            )
+
+    def get_staff_member_profile(
+        self,
+        *,
+        actor_user_id: str | None,
+        user_id: str,
+    ) -> StaffMemberProfile | None:
+        with self._session_factory() as session:
+            user = session.get(ManagedUserModel, user_id)
+            if user is None:
+                return None
+            self._assert_staff_manageable(
+                actor_user_id=actor_user_id,
+                target_user=user,
+                require_creator_match=True,
+            )
+            return StaffMemberProfile(
+                user_id=user.user_id,
+                full_name=user.full_name,
+                contact_number=self._contact_number_for_user(user),
+                speciality=(user.speciality or "").strip(),
+                joining_date=self._ensure_utc(user.joining_date or user.created_on),
+                role_name=self._normalized_role_for_existing_user(user),
+                username=user.username,
+                created_by_user_id=user.created_by_user_id,
+                created_by_name=self._creator_name_for_user(session=session, user=user),
+            )
+
+    def create_staff_member(
+        self,
+        *,
+        actor_user_id: str | None,
+        username: str,
+        full_name: str,
+        contact_number: str,
+        speciality: str,
+        joining_date: datetime,
+        role_name: str,
+    ) -> StaffMemberSaveResult:
+        actor_role = self.role_name_for_user(actor_user_id)
+        if actor_role != "Admin":
+            raise ValueError("Only store admin users can create store staff.")
+
+        normalized_username = self._normalize_managed_username(username)
+        normalized_full_name = self._normalize_required_value(
+            full_name,
+            "Full name is required before a staff member can be created.",
+        )
+        normalized_contact_number = self._normalize_required_value(
+            contact_number,
+            "Contact number is required before a staff member can be created.",
+        )
+        normalized_speciality = speciality.strip()
+        normalized_joining_date = self._normalize_joining_date(joining_date)
+        selected_role = self._normalize_staff_role_for_actor(
+            actor_user_id=actor_user_id,
+            role_name=role_name,
+        )
+        store_scope_id = self._resolve_store_scope(actor_user_id=actor_user_id)
+        temporary_password = self.default_password_for_username(normalized_username)
+
+        with self._session_factory() as session:
+            existing_user = session.scalar(
+                select(ManagedUserModel).where(ManagedUserModel.username == normalized_username)
+            )
+            if existing_user is not None:
+                raise ValueError(f"Username '{normalized_username}' already exists.")
+
+            created_on = datetime.now(tz=timezone.utc)
+            user_id = f"u-managed-{uuid4().hex[:8]}"
+            user = self._build_user(
+                user_id=user_id,
+                username=normalized_username,
+                full_name=normalized_full_name,
+                contact_info=normalized_contact_number,
+                store_id=store_scope_id,
+                created_on=created_on,
+                roles=[selected_role],
+                permissions=self._permissions_for_selected_role(selected_role),
+                activities=[
+                    (
+                        created_on,
+                        f"Staff member created by {self.display_name_for_user(actor_user_id) or 'Store Admin'}",
+                    ),
+                ],
+                speciality=normalized_speciality,
+                joining_date=normalized_joining_date,
+                created_by_user_id=actor_user_id,
+            )
+            user.auth_record = ManagedUserAuthModel(
+                user_id=user_id,
+                mobile=normalized_contact_number,
+                password_hash=self._password_hasher(temporary_password),
+                failed_attempts=0,
+                lockout_until=None,
+                password_reset_required=True,
+            )
+            session.add(user)
+            session.commit()
+            return StaffMemberSaveResult(
+                user_id=user_id,
+                username=normalized_username,
+                temporary_password=temporary_password,
+            )
+
+    def update_staff_member(
+        self,
+        *,
+        actor_user_id: str | None,
+        user_id: str,
+        full_name: str,
+        contact_number: str,
+        speciality: str,
+        joining_date: datetime,
+        role_name: str,
+    ) -> StaffMemberSaveResult:
+        normalized_full_name = self._normalize_required_value(
+            full_name,
+            "Full name is required before a staff member can be updated.",
+        )
+        normalized_contact_number = self._normalize_required_value(
+            contact_number,
+            "Contact number is required before a staff member can be updated.",
+        )
+        normalized_speciality = speciality.strip()
+        normalized_joining_date = self._normalize_joining_date(joining_date)
+        selected_role = self._normalize_staff_role_for_actor(
+            actor_user_id=actor_user_id,
+            role_name=role_name,
+        )
+
+        with self._session_factory() as session:
+            user = session.get(ManagedUserModel, user_id)
+            if user is None:
+                raise ValueError("The selected staff member no longer exists.")
+            self._assert_staff_manageable(
+                actor_user_id=actor_user_id,
+                target_user=user,
+                require_creator_match=True,
+            )
+
+            user.full_name = normalized_full_name
+            user.contact_info = normalized_contact_number
+            user.speciality = normalized_speciality
+            user.joining_date = normalized_joining_date
+            user.roles[:] = [
+                ManagedUserRoleModel(user_id=user.user_id, role_name=selected_role)
+            ]
+            user.permissions[:] = [
+                ManagedUserPermissionModel(
+                    user_id=user.user_id,
+                    permission_name=permission_name,
+                )
+                for permission_name in self._permissions_for_selected_role(selected_role)
+            ]
+            if user.auth_record is not None:
+                user.auth_record.mobile = normalized_contact_number
+            user.activities.append(
+                ManagedUserActivityModel(
+                    user_id=user.user_id,
+                    occurred_at=datetime.now(tz=timezone.utc),
+                    summary=f"Staff member updated by {self.display_name_for_user(actor_user_id) or 'Store Admin'}",
+                )
+            )
+            session.commit()
+            return StaffMemberSaveResult(user_id=user.user_id, username=user.username)
+
     def get_store_dashboard_context_for_user(
         self,
         user_id: str | None,
@@ -1186,6 +1459,7 @@ class AdminUserManagementService:
                         else f"User record created in store workspace ({store_scope_id})",
                     ),
                 ],
+                created_by_user_id=actor_user_id,
             )
             user.auth_record = ManagedUserAuthModel(
                 user_id=user_id,
@@ -1283,8 +1557,13 @@ class AdminUserManagementService:
                     data_updated = True
                     continue
 
-                if not row.permission_blob.strip():
-                    row.permission_blob = permission_blob
+                existing_permissions = self._deserialize_permissions(row.permission_blob)
+                merged_permissions = tuple(
+                    dict.fromkeys((*default_permissions, *existing_permissions))
+                )
+                merged_permission_blob = self._serialize_permissions(merged_permissions)
+                if row.permission_blob != merged_permission_blob:
+                    row.permission_blob = merged_permission_blob
                     row.updated_on = now
                     data_updated = True
                 if not row.scope.strip():
@@ -1384,6 +1663,36 @@ class AdminUserManagementService:
             if auth_updated or data_updated:
                 session.commit()
 
+    def _backfill_staff_metadata(self) -> None:
+        with self._session_factory() as session:
+            stores = {
+                store.store_id: store
+                for store in session.scalars(select(ManagedStoreModel)).all()
+            }
+            users = session.scalars(select(ManagedUserModel)).all()
+            updated = False
+            for user in users:
+                if user.speciality is None:
+                    user.speciality = ""
+                    updated = True
+                if user.joining_date is None:
+                    user.joining_date = user.created_on
+                    updated = True
+                if user.created_by_user_id:
+                    continue
+                if not user.store_id:
+                    continue
+                normalized_role = self._normalized_role_for_existing_user(user)
+                if normalized_role not in {"Manager", "Worker"}:
+                    continue
+                store = stores.get(user.store_id)
+                if store is None or not store.store_admin_user_id:
+                    continue
+                user.created_by_user_id = store.store_admin_user_id
+                updated = True
+            if updated:
+                session.commit()
+
     def _build_user(
         self,
         *,
@@ -1396,6 +1705,9 @@ class AdminUserManagementService:
         roles: list[str],
         permissions: list[str],
         activities: list[tuple[datetime, str]],
+        speciality: str = "",
+        joining_date: datetime | None = None,
+        created_by_user_id: str | None = None,
     ) -> ManagedUserModel:
         user = ManagedUserModel(
             user_id=user_id,
@@ -1403,6 +1715,9 @@ class AdminUserManagementService:
             full_name=full_name,
             contact_info=contact_info,
             store_id=store_id,
+            speciality=speciality,
+            joining_date=joining_date or created_on,
+            created_by_user_id=created_by_user_id,
             created_on=created_on,
         )
         user.roles = [
@@ -1511,8 +1826,22 @@ class AdminUserManagementService:
             return None
         return self.store_id_for_user(actor_user_id)
 
+    def _contact_number_for_user(self, user: ManagedUserModel) -> str:
+        if user.auth_record is not None and user.auth_record.mobile:
+            return user.auth_record.mobile
+        extracted_mobile = self._extract_mobile(user.contact_info)
+        if extracted_mobile:
+            return extracted_mobile
+        return user.contact_info.split("|", maxsplit=1)[0].strip()
+
+    def _creator_name_for_user(self, *, session: Session, user: ManagedUserModel) -> str:
+        if not user.created_by_user_id:
+            return ""
+        creator = session.get(ManagedUserModel, user.created_by_user_id)
+        return creator.full_name if creator is not None else ""
+
     def _extract_mobile(self, contact_info: str) -> str | None:
-        match = re.search(r"\+\d{7,15}", contact_info)
+        match = re.search(r"(?:\+\d{7,15}|\d{7,15})", contact_info)
         if match is None:
             return None
         return match.group(0)
@@ -1526,6 +1855,66 @@ class AdminUserManagementService:
     def _compose_contact_info(self, *, mobile: str, email: str) -> str:
         contact_parts = [mobile.strip(), email.strip().lower()]
         return " | ".join(part for part in contact_parts if part)
+
+    def _normalize_managed_username(self, username: str) -> str:
+        normalized_username = username.strip().lower()
+        if not normalized_username:
+            raise ValueError("Username is required before a new staff member can be created.")
+        if not re.fullmatch(r"[a-zA-Z0-9._-]+", normalized_username):
+            raise ValueError(
+                "Username can only contain letters, numbers, dots, underscores, and hyphens."
+            )
+        return normalized_username
+
+    def _normalize_required_value(self, value: str, message: str) -> str:
+        normalized_value = value.strip()
+        if not normalized_value:
+            raise ValueError(message)
+        return normalized_value
+
+    def _normalize_joining_date(self, joining_date: datetime) -> datetime:
+        if not isinstance(joining_date, datetime):
+            raise ValueError("Joining date is required.")
+        normalized_date = joining_date
+        if normalized_date.tzinfo is None:
+            normalized_date = normalized_date.replace(tzinfo=timezone.utc)
+        else:
+            normalized_date = normalized_date.astimezone(timezone.utc)
+        return normalized_date.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def _normalize_staff_role_for_actor(
+        self,
+        *,
+        actor_user_id: str | None,
+        role_name: str,
+    ) -> str:
+        selected_role = role_name.strip().title()
+        allowed_roles = set(self.available_roles_for_actor(actor_user_id)) & {"Manager", "Worker"}
+        if selected_role not in allowed_roles:
+            allowed_label = ", ".join(sorted(allowed_roles)) or "Manager, Worker"
+            raise ValueError(f"This account can only assign these staff roles: {allowed_label}.")
+        return selected_role
+
+    def _assert_staff_manageable(
+        self,
+        *,
+        actor_user_id: str | None,
+        target_user: ManagedUserModel,
+        require_creator_match: bool,
+    ) -> None:
+        actor_role = self.role_name_for_user(actor_user_id)
+        if actor_role == "Superadmin":
+            return
+
+        actor_store_id = self.store_id_for_user(actor_user_id)
+        target_role = self._normalized_role_for_existing_user(target_user)
+        allowed_roles = set(self.available_roles_for_actor(actor_user_id))
+        if actor_store_id is None or target_user.store_id != actor_store_id:
+            raise ValueError("This account cannot manage staff outside the active store.")
+        if target_role not in allowed_roles:
+            raise ValueError("This account cannot manage the selected user.")
+        if require_creator_match and actor_user_id is not None and target_user.created_by_user_id != actor_user_id:
+            raise ValueError("This account can only manage staff members it created.")
 
     def _normalize_store_fields(
         self,
@@ -1639,6 +2028,9 @@ class AdminUserManagementService:
         }
         required_columns = {
             "store_id": "ALTER TABLE managed_users ADD COLUMN store_id VARCHAR(50)",
+            "speciality": "ALTER TABLE managed_users ADD COLUMN speciality VARCHAR(150)",
+            "joining_date": "ALTER TABLE managed_users ADD COLUMN joining_date DATETIME",
+            "created_by_user_id": "ALTER TABLE managed_users ADD COLUMN created_by_user_id VARCHAR(50)",
         }
         missing_statements = [
             statement

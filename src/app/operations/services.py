@@ -50,6 +50,17 @@ class OrderModel(Base):
     customer: Mapped[CustomerModel] = relationship(back_populates="orders")
 
 
+class ItemModel(Base):
+    __tablename__ = "ops_items"
+
+    item_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    store_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    item_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    cost: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    created_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 @dataclass(frozen=True)
 class CustomerRow:
     customer_id: str
@@ -73,6 +84,16 @@ class OrderRow:
     order_total: Decimal
     status: str
     notes: str
+    created_on: datetime
+    updated_on: datetime
+
+
+@dataclass(frozen=True)
+class ItemRow:
+    item_id: str
+    store_id: str
+    item_name: str
+    cost: Decimal
     created_on: datetime
     updated_on: datetime
 
@@ -104,6 +125,121 @@ class OperationsService:
         with self._session_factory() as session:
             rows = session.scalars(select(OrderModel).order_by(OrderModel.updated_on.desc())).all()
             return tuple(self._to_order_row(row) for row in rows)
+
+    def list_items(self, *, store_id: str) -> tuple[ItemRow, ...]:
+        normalized_store_id = store_id.strip()
+        if not normalized_store_id:
+            return ()
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(ItemModel)
+                .where(ItemModel.store_id == normalized_store_id)
+                .order_by(ItemModel.item_name.asc())
+            ).all()
+            return tuple(self._to_item_row(row) for row in rows)
+
+    def get_item(self, *, store_id: str, item_id: str) -> ItemRow | None:
+        normalized_store_id = store_id.strip()
+        normalized_item_id = item_id.strip()
+        if not normalized_store_id or not normalized_item_id:
+            return None
+
+        with self._session_factory() as session:
+            row = session.scalar(
+                select(ItemModel).where(
+                    ItemModel.store_id == normalized_store_id,
+                    ItemModel.item_id == normalized_item_id,
+                )
+            )
+            if row is None:
+                return None
+            return self._to_item_row(row)
+
+    def create_item(
+        self,
+        *,
+        store_id: str,
+        item_name: str,
+        cost: Decimal,
+    ) -> str:
+        normalized_store_id = store_id.strip()
+        normalized_item_name = item_name.strip()
+        if not normalized_store_id:
+            raise ValueError("Store context is required before creating an item.")
+        if not normalized_item_name:
+            raise ValueError("Item name is required.")
+        if cost < Decimal("0.00"):
+            raise ValueError("Item cost cannot be negative.")
+
+        now = datetime.now(tz=timezone.utc)
+        item_id = f"ITEM-{now.strftime('%Y%m%d%H%M%S')}-{now.microsecond:06d}"
+        normalized_cost = cost.quantize(Decimal("0.01"))
+        with self._session_factory() as session:
+            existing_item = session.scalar(
+                select(ItemModel).where(
+                    ItemModel.store_id == normalized_store_id,
+                    func.lower(ItemModel.item_name) == normalized_item_name.lower(),
+                )
+            )
+            if existing_item is not None:
+                raise ValueError(f"Item '{normalized_item_name}' already exists for this store.")
+
+            item = ItemModel(
+                item_id=item_id,
+                store_id=normalized_store_id,
+                item_name=normalized_item_name,
+                cost=normalized_cost,
+                created_on=now,
+                updated_on=now,
+            )
+            session.add(item)
+            session.commit()
+            return item_id
+
+    def update_item(
+        self,
+        *,
+        store_id: str,
+        item_id: str,
+        item_name: str,
+        cost: Decimal,
+    ) -> None:
+        normalized_store_id = store_id.strip()
+        normalized_item_id = item_id.strip()
+        normalized_item_name = item_name.strip()
+        if not normalized_store_id:
+            raise ValueError("Store context is required before updating an item.")
+        if not normalized_item_id:
+            raise ValueError("Item selection is required before updating an item.")
+        if not normalized_item_name:
+            raise ValueError("Item name is required.")
+        if cost < Decimal("0.00"):
+            raise ValueError("Item cost cannot be negative.")
+
+        with self._session_factory() as session:
+            item = session.scalar(
+                select(ItemModel).where(
+                    ItemModel.store_id == normalized_store_id,
+                    ItemModel.item_id == normalized_item_id,
+                )
+            )
+            if item is None:
+                raise ValueError("The selected item could not be found for this store.")
+
+            duplicate_item = session.scalar(
+                select(ItemModel).where(
+                    ItemModel.store_id == normalized_store_id,
+                    func.lower(ItemModel.item_name) == normalized_item_name.lower(),
+                    ItemModel.item_id != normalized_item_id,
+                )
+            )
+            if duplicate_item is not None:
+                raise ValueError(f"Item '{normalized_item_name}' already exists for this store.")
+
+            item.item_name = normalized_item_name
+            item.cost = cost.quantize(Decimal("0.01"))
+            item.updated_on = datetime.now(tz=timezone.utc)
+            session.commit()
 
     def get_customer(self, customer_id: str) -> CustomerRow | None:
         with self._session_factory() as session:
@@ -364,6 +500,16 @@ class OperationsService:
             order_total=Decimal(row.order_total).quantize(Decimal("0.01")),
             status=row.status,
             notes=row.notes,
+            created_on=self._ensure_utc(row.created_on),
+            updated_on=self._ensure_utc(row.updated_on),
+        )
+
+    def _to_item_row(self, row: ItemModel) -> ItemRow:
+        return ItemRow(
+            item_id=row.item_id,
+            store_id=row.store_id,
+            item_name=row.item_name,
+            cost=Decimal(row.cost).quantize(Decimal("0.01")),
             created_on=self._ensure_utc(row.created_on),
             updated_on=self._ensure_utc(row.updated_on),
         )

@@ -3,25 +3,38 @@ from __future__ import annotations
 import importlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Callable
 from uuid import uuid4
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QDate, QTimer, Qt
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QDateEdit,
+    QDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QComboBox,
     QMainWindow,
     QPushButton,
     QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from app.admin.services import AdminStoreRecord, AdminUserManagementService, StoreDashboardContext
+from app.admin.services import (
+    AdminStoreRecord,
+    AdminUserManagementService,
+    StaffMemberProfile,
+    StoreDashboardContext,
+)
 from app.auth.dtos import AuthFailureCode, LoginRequest
 from app.auth.services import AuthService
 from app.authorization.services import (
@@ -31,6 +44,7 @@ from app.authorization.services import (
     ReportingService,
 )
 from app.desktop_shell.ui.admin_management import AccessControlWorkspace
+from app.operations.services import ItemRow, OperationsService
 from app.platform.audit import AuditReviewService, AuditService
 
 
@@ -251,7 +265,1082 @@ class StoreProfileHomeScreen(QWidget):
         self.feedback_label.update()
 
 
+class StoreAdminDashboardScreen(QWidget):
+    def __init__(
+        self,
+        *,
+        user_management_service: AdminUserManagementService,
+        operations_service: OperationsService,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._user_management_service = user_management_service
+        self._operations_service = operations_service
+        self._current_user_id: str | None = None
+        self._store_context: StoreDashboardContext | None = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(16)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(16)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setRowStretch(0, 1)
+        grid.setRowStretch(1, 1)
+
+        self.staff_table = self._build_table(("Full Name", "Role"))
+        self.items_table = self._build_table(("Item Name", "Cost"))
+        self.future_a_placeholder = self._build_placeholder(
+            "Reserved for upcoming store metrics and workflow tools."
+        )
+        self.future_b_placeholder = self._build_placeholder(
+            "Reserved for additional store-specific enhancements."
+        )
+
+        self.staff_card = self._build_card(
+            title="Store Staff",
+            subtitle="Store users assigned to this location.",
+            content_widget=self.staff_table,
+        )
+        self.items_card = self._build_card(
+            title="Store Items",
+            subtitle="Current item catalog and item costs for this store.",
+            content_widget=self.items_table,
+        )
+        self.future_a_card = self._build_card(
+            title="Future Use",
+            subtitle="Reserved area for future enhancements.",
+            content_widget=self.future_a_placeholder,
+        )
+        self.future_b_card = self._build_card(
+            title="Future Use",
+            subtitle="Reserved area for future enhancements.",
+            content_widget=self.future_b_placeholder,
+        )
+
+        grid.addWidget(self.staff_card, 0, 0)
+        grid.addWidget(self.items_card, 0, 1)
+        grid.addWidget(self.future_a_card, 1, 0)
+        grid.addWidget(self.future_b_card, 1, 1)
+
+        root.addLayout(grid)
+        root.addStretch(1)
+
+        self.clear_context()
+
+    def set_context(
+        self,
+        *,
+        current_user_id: str | None,
+        store_context: StoreDashboardContext,
+    ) -> None:
+        self._current_user_id = current_user_id
+        self._store_context = store_context
+        self.refresh_data()
+
+    def clear_context(self) -> None:
+        self._current_user_id = None
+        self._store_context = None
+        self._set_table_rows(
+            self.staff_table,
+            rows=(),
+            empty_message="Store staff will appear here after users are created.",
+        )
+        self._set_table_rows(
+            self.items_table,
+            rows=(),
+            empty_message="Store items will appear here after they are created.",
+        )
+
+    def refresh_data(self) -> None:
+        if self._store_context is None:
+            self.clear_context()
+            return
+
+        staff_rows = self._user_management_service.list_store_staff(
+            actor_user_id=self._current_user_id
+        )
+        item_rows = self._operations_service.list_items(store_id=self._store_context.store_id)
+
+        self._set_table_rows(
+            self.staff_table,
+            rows=tuple((row.full_name, row.role_name) for row in staff_rows),
+            empty_message="Create store staff to populate this table.",
+        )
+        self._set_table_rows(
+            self.items_table,
+            rows=tuple((row.item_name, f"INR {row.cost:,.2f}") for row in item_rows),
+            empty_message="Create items to populate this table.",
+            numeric_columns={1},
+        )
+
+    def _build_card(
+        self,
+        *,
+        title: str,
+        subtitle: str,
+        content_widget: QWidget,
+    ) -> QFrame:
+        card = QFrame()
+        card.setObjectName("InnerCard")
+        card.setMinimumHeight(250)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("SectionTitle")
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setObjectName("SectionCopy")
+        subtitle_label.setWordWrap(True)
+
+        layout.addWidget(title_label)
+        layout.addWidget(subtitle_label)
+        layout.addWidget(content_widget, stretch=1)
+        return card
+
+    def _build_table(self, headers: tuple[str, ...]) -> QTableWidget:
+        table = QTableWidget(0, len(headers))
+        table.setObjectName("DashboardTable")
+        table.setHorizontalHeaderLabels(list(headers))
+        table.setAlternatingRowColors(True)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        table.setShowGrid(False)
+        table.setWordWrap(False)
+        table.setCornerButtonEnabled(False)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(38)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setMinimumSectionSize(120)
+        return table
+
+    def _build_placeholder(self, message: str) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(0)
+        label = QLabel(message)
+        label.setObjectName("DashboardPlaceholder")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        layout.addStretch(1)
+        return widget
+
+    def _set_table_rows(
+        self,
+        table: QTableWidget,
+        *,
+        rows: tuple[tuple[str, str], ...],
+        empty_message: str,
+        numeric_columns: set[int] | None = None,
+    ) -> None:
+        numeric_columns = numeric_columns or set()
+        table.setSortingEnabled(False)
+        table.clearSpans()
+        table.clearContents()
+
+        if not rows:
+            table.setRowCount(1)
+            table.setSpan(0, 0, 1, table.columnCount())
+            empty_item = QTableWidgetItem(empty_message)
+            empty_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            empty_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            )
+            table.setItem(0, 0, empty_item)
+            for column_index in range(1, table.columnCount()):
+                table.setItem(0, column_index, QTableWidgetItem(""))
+            return
+
+        table.setRowCount(len(rows))
+        for row_index, row_values in enumerate(rows):
+            for column_index, value in enumerate(row_values):
+                item = QTableWidgetItem(value)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                alignment = (
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    if column_index in numeric_columns
+                    else Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                )
+                item.setTextAlignment(alignment)
+                table.setItem(row_index, column_index, item)
+
+
+class StaffMemberEditorDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        role_options: tuple[str, ...],
+        created_by_name: str,
+        profile: StaffMemberProfile | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._profile = profile
+        self._role_options = role_options
+        self.setModal(True)
+        self.setWindowTitle("Add Staff Member" if profile is None else "Staff Member Details")
+        self.setMinimumSize(820, 420)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(16)
+
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(16)
+        header_copy = QVBoxLayout()
+        header_copy.setSpacing(6)
+
+        title = QLabel("Add Staff Member" if profile is None else "Edit Staff Member")
+        title.setObjectName("SectionTitle")
+        copy = QLabel(
+            "Capture the staff member profile in one screen. Only Manager and Worker roles are available in this store."
+        )
+        copy.setObjectName("SectionCopy")
+        copy.setWordWrap(True)
+
+        header_copy.addWidget(title)
+        header_copy.addWidget(copy)
+
+        action_layout = QHBoxLayout()
+        action_layout.setSpacing(10)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setObjectName("SecondaryButton")
+        self.save_button = QPushButton("Add Staff Member" if profile is None else "Update Staff Member")
+        self.save_button.setObjectName("ActionButton")
+        self.save_button.setMinimumHeight(42)
+        action_layout.addWidget(self.cancel_button)
+        action_layout.addWidget(self.save_button)
+
+        header_layout.addLayout(header_copy, stretch=1)
+        header_layout.addLayout(action_layout)
+
+        self.feedback_label = QLabel("")
+        self.feedback_label.setObjectName("StatusMessage")
+        self.feedback_label.setWordWrap(True)
+        self.feedback_label.hide()
+
+        content_layout = QHBoxLayout()
+        content_layout.setSpacing(16)
+
+        identity_card = QFrame()
+        identity_card.setObjectName("InnerCard")
+        identity_layout = QVBoxLayout(identity_card)
+        identity_layout.setContentsMargins(18, 18, 18, 18)
+        identity_layout.setSpacing(12)
+
+        identity_title = QLabel("Identity")
+        identity_title.setObjectName("SectionTitle")
+
+        identity_form = QFormLayout()
+        identity_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        identity_form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        identity_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        identity_form.setHorizontalSpacing(12)
+        identity_form.setVerticalSpacing(12)
+
+        self.full_name_input = QLineEdit()
+        self.full_name_input.setPlaceholderText("Enter full name")
+        self.username_input = QLineEdit()
+        self.username_input.setPlaceholderText("Enter username")
+        self.contact_number_input = QLineEdit()
+        self.contact_number_input.setPlaceholderText("Enter contact number")
+        self.speciality_input = QLineEdit()
+        self.speciality_input.setPlaceholderText("Alterations, finishing, packaging, dispatch...")
+
+        identity_form.addRow(self._form_label("Full name"), self.full_name_input)
+        identity_form.addRow(self._form_label("Username"), self.username_input)
+        identity_form.addRow(self._form_label("Contact number"), self.contact_number_input)
+        identity_form.addRow(self._form_label("Speciality"), self.speciality_input)
+
+        identity_layout.addWidget(identity_title)
+        identity_layout.addLayout(identity_form)
+
+        assignment_card = QFrame()
+        assignment_card.setObjectName("InnerCard")
+        assignment_layout = QVBoxLayout(assignment_card)
+        assignment_layout.setContentsMargins(18, 18, 18, 18)
+        assignment_layout.setSpacing(12)
+
+        assignment_title = QLabel("Assignment")
+        assignment_title.setObjectName("SectionTitle")
+
+        assignment_form = QFormLayout()
+        assignment_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        assignment_form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        assignment_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        assignment_form.setHorizontalSpacing(12)
+        assignment_form.setVerticalSpacing(12)
+
+        self.joining_date_input = QDateEdit()
+        self.joining_date_input.setCalendarPopup(True)
+        self.joining_date_input.setDisplayFormat("yyyy-MM-dd")
+        self.joining_date_input.setMinimumHeight(42)
+        self.role_combo = QComboBox()
+        self.role_combo.setMinimumHeight(42)
+        self.created_by_input = QLineEdit()
+        self.created_by_input.setReadOnly(True)
+
+        assignment_form.addRow(self._form_label("Joining date"), self.joining_date_input)
+        assignment_form.addRow(self._form_label("Role"), self.role_combo)
+        assignment_form.addRow(self._form_label("Created by"), self.created_by_input)
+
+        assignment_layout.addWidget(assignment_title)
+        assignment_layout.addLayout(assignment_form)
+        assignment_layout.addStretch(1)
+
+        content_layout.addWidget(identity_card, stretch=1)
+        content_layout.addWidget(assignment_card, stretch=1)
+
+        root.addLayout(header_layout)
+        root.addWidget(self.feedback_label)
+        root.addLayout(content_layout)
+
+        self.cancel_button.clicked.connect(self.reject)
+        self.save_button.clicked.connect(self._attempt_accept)
+
+        self.role_combo.addItems(list(role_options))
+        self._populate(profile=profile, created_by_name=created_by_name)
+
+    def payload(self) -> dict[str, object]:
+        selected_date = self.joining_date_input.date().toPython()
+        joining_date = datetime(
+            selected_date.year,
+            selected_date.month,
+            selected_date.day,
+            tzinfo=timezone.utc,
+        )
+        return {
+            "full_name": self.full_name_input.text().strip(),
+            "username": self.username_input.text().strip(),
+            "contact_number": self.contact_number_input.text().strip(),
+            "speciality": self.speciality_input.text().strip(),
+            "joining_date": joining_date,
+            "role_name": self.role_combo.currentText().strip(),
+        }
+
+    def set_feedback(self, message: str, *, tone: str) -> None:
+        self.feedback_label.setText(message)
+        self.feedback_label.setVisible(bool(message))
+        self.feedback_label.setProperty("tone", tone)
+        self.feedback_label.style().unpolish(self.feedback_label)
+        self.feedback_label.style().polish(self.feedback_label)
+        self.feedback_label.update()
+
+    def _populate(self, *, profile: StaffMemberProfile | None, created_by_name: str) -> None:
+        self.set_feedback("", tone="success")
+        default_role = self._role_options[0] if self._role_options else "Worker"
+        if profile is None:
+            self.full_name_input.clear()
+            self.username_input.clear()
+            self.username_input.setReadOnly(False)
+            self.contact_number_input.clear()
+            self.speciality_input.clear()
+            self.joining_date_input.setDate(QDate.currentDate())
+            self.role_combo.setCurrentText(default_role)
+            self.created_by_input.setText(created_by_name)
+            return
+
+        self.full_name_input.setText(profile.full_name)
+        self.username_input.setText(profile.username)
+        self.username_input.setReadOnly(True)
+        self.contact_number_input.setText(profile.contact_number)
+        self.speciality_input.setText(profile.speciality)
+        self.joining_date_input.setDate(
+            QDate(
+                profile.joining_date.year,
+                profile.joining_date.month,
+                profile.joining_date.day,
+            )
+        )
+        self.role_combo.setCurrentText(profile.role_name)
+        self.created_by_input.setText(profile.created_by_name or created_by_name)
+
+    def _attempt_accept(self) -> None:
+        payload = self.payload()
+        if not payload["full_name"]:
+            self.set_feedback("Full name is required.", tone="error")
+            return
+        if not payload["username"]:
+            self.set_feedback("Username is required.", tone="error")
+            return
+        if not payload["contact_number"]:
+            self.set_feedback("Contact number is required.", tone="error")
+            return
+        if not payload["role_name"]:
+            self.set_feedback("Role is required.", tone="error")
+            return
+        self.accept()
+
+    def _form_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("FormLabel")
+        return label
+
+
+class StoreStaffCreateScreen(QWidget):
+    TABLE_HEADERS = (
+        "Full Name",
+        "Contact Number",
+        "Speciality",
+        "Joining Date",
+        "Role",
+        "Username",
+        "Created By",
+    )
+
+    def __init__(
+        self,
+        *,
+        user_management_service: AdminUserManagementService,
+        on_staff_created: Callable[[], None] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._user_management_service = user_management_service
+        self._on_staff_created = on_staff_created
+        self._current_user_id: str | None = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(16)
+
+        toolbar = QHBoxLayout()
+        toolbar.setContentsMargins(0, 0, 0, 0)
+        toolbar.setSpacing(12)
+
+        self.add_staff_button = QPushButton("Add Staff Member")
+        self.add_staff_button.setObjectName("ActionButton")
+        self.add_staff_button.setMinimumHeight(44)
+
+        toolbar.addWidget(self.add_staff_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        toolbar.addStretch(1)
+
+        self.staff_feedback_label = QLabel("")
+        self.staff_feedback_label.setObjectName("StatusMessage")
+        self.staff_feedback_label.setWordWrap(True)
+        self.staff_feedback_label.hide()
+
+        self.staff_password_label = QLabel("")
+        self.staff_password_label.setObjectName("SectionCopy")
+        self.staff_password_label.setWordWrap(True)
+        self.staff_password_label.hide()
+
+        table_card = QFrame()
+        table_card.setObjectName("InnerCard")
+        table_layout = QVBoxLayout(table_card)
+        table_layout.setContentsMargins(22, 22, 22, 22)
+        table_layout.setSpacing(12)
+
+        title = QLabel("Store Staff")
+        title.setObjectName("SectionTitle")
+        copy = QLabel(
+            "Double-click a row to review or update that staff member. This table only shows staff members created by the signed-in store admin."
+        )
+        copy.setObjectName("SectionCopy")
+        copy.setWordWrap(True)
+
+        self.staff_table = QTableWidget(0, len(self.TABLE_HEADERS))
+        self.staff_table.setObjectName("DashboardTable")
+        self.staff_table.setHorizontalHeaderLabels(list(self.TABLE_HEADERS))
+        self.staff_table.setAlternatingRowColors(True)
+        self.staff_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.staff_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.staff_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.staff_table.setSortingEnabled(True)
+        self.staff_table.setShowGrid(False)
+        self.staff_table.verticalHeader().setVisible(False)
+        self.staff_table.verticalHeader().setDefaultSectionSize(38)
+        self.staff_table.horizontalHeader().setStretchLastSection(False)
+        self.staff_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.staff_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.staff_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.staff_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.staff_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.staff_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.staff_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+
+        table_layout.addWidget(title)
+        table_layout.addWidget(copy)
+        table_layout.addWidget(self.staff_table, stretch=1)
+
+        root.addLayout(toolbar)
+        root.addWidget(self.staff_feedback_label)
+        root.addWidget(self.staff_password_label)
+        root.addWidget(table_card, stretch=1)
+
+        self.add_staff_button.clicked.connect(self._open_add_staff_dialog)
+        self.staff_table.cellDoubleClicked.connect(self._open_staff_dialog_for_row)
+        self.set_current_user_id(None)
+
+    def set_current_user_id(self, current_user_id: str | None) -> None:
+        self._current_user_id = current_user_id
+        self._set_feedback("", tone="success")
+        self.staff_password_label.clear()
+        self.staff_password_label.hide()
+        self.refresh_data()
+
+    def refresh_data(self) -> None:
+        role_options = self._role_options()
+        self.add_staff_button.setEnabled(bool(role_options) and self._current_user_id is not None)
+        self.staff_table.setSortingEnabled(False)
+        self.staff_table.clearSpans()
+        self.staff_table.clearContents()
+
+        staff_rows = self._user_management_service.list_store_staff(
+            actor_user_id=self._current_user_id,
+            created_by_actor_only=True,
+        )
+        if not staff_rows:
+            self.staff_table.setRowCount(1)
+            self.staff_table.setSpan(0, 0, 1, self.staff_table.columnCount())
+            empty_item = QTableWidgetItem(
+                "No staff members created yet. Use 'Add Staff Member' to create the first one."
+            )
+            empty_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.staff_table.setItem(0, 0, empty_item)
+            for column_index in range(1, self.staff_table.columnCount()):
+                self.staff_table.setItem(0, column_index, QTableWidgetItem(""))
+            return
+
+        self.staff_table.setRowCount(len(staff_rows))
+        for row_index, staff_row in enumerate(staff_rows):
+            row_values = (
+                staff_row.full_name,
+                staff_row.contact_number,
+                staff_row.speciality or "Not set",
+                staff_row.joining_date.astimezone(timezone.utc).strftime("%Y-%m-%d"),
+                staff_row.role_name,
+                staff_row.username,
+                staff_row.created_by_name or "Current admin",
+            )
+            for column_index, value in enumerate(row_values):
+                item = QTableWidgetItem(value)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                item.setData(Qt.ItemDataRole.UserRole, staff_row.user_id)
+                self.staff_table.setItem(row_index, column_index, item)
+        self.staff_table.setSortingEnabled(True)
+        self.staff_table.sortItems(0, Qt.SortOrder.AscendingOrder)
+
+    def _role_options(self) -> tuple[str, ...]:
+        return tuple(
+            role_name
+            for role_name in self._user_management_service.available_roles_for_actor(self._current_user_id)
+            if role_name in {"Manager", "Worker"}
+        )
+
+    def _open_add_staff_dialog(self) -> None:
+        if self._current_user_id is None:
+            return
+        role_options = self._role_options()
+        if not role_options:
+            self._set_feedback("This account cannot create store staff.", tone="error")
+            return
+
+        creator_name = self._user_management_service.display_name_for_user(self._current_user_id)
+        dialog = StaffMemberEditorDialog(
+            role_options=role_options,
+            created_by_name=creator_name,
+            parent=self,
+        )
+        while dialog.exec() == QDialog.DialogCode.Accepted:
+            payload = dialog.payload()
+            try:
+                result = self._user_management_service.create_staff_member(
+                    actor_user_id=self._current_user_id,
+                    username=str(payload["username"]),
+                    full_name=str(payload["full_name"]),
+                    contact_number=str(payload["contact_number"]),
+                    speciality=str(payload["speciality"]),
+                    joining_date=payload["joining_date"],  # type: ignore[arg-type]
+                    role_name=str(payload["role_name"]),
+                )
+            except ValueError as exc:
+                dialog.set_feedback(str(exc), tone="error")
+                continue
+
+            self._set_feedback("Staff member created successfully.", tone="success")
+            self.staff_password_label.setText(
+                f"Temporary password for {result.username}: {result.temporary_password}"
+            )
+            self.staff_password_label.show()
+            self.refresh_data()
+            if self._on_staff_created is not None:
+                self._on_staff_created()
+            break
+
+    def _open_staff_dialog_for_row(self, row: int, _column: int) -> None:
+        user_item = self.staff_table.item(row, 0)
+        if user_item is None:
+            return
+        user_id = user_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(user_id, str):
+            return
+        if self._current_user_id is None:
+            return
+
+        profile = self._user_management_service.get_staff_member_profile(
+            actor_user_id=self._current_user_id,
+            user_id=user_id,
+        )
+        if profile is None:
+            self._set_feedback("The selected staff member could not be loaded.", tone="error")
+            return
+
+        dialog = StaffMemberEditorDialog(
+            role_options=self._role_options(),
+            created_by_name=profile.created_by_name,
+            profile=profile,
+            parent=self,
+        )
+        while dialog.exec() == QDialog.DialogCode.Accepted:
+            payload = dialog.payload()
+            try:
+                self._user_management_service.update_staff_member(
+                    actor_user_id=self._current_user_id,
+                    user_id=user_id,
+                    full_name=str(payload["full_name"]),
+                    contact_number=str(payload["contact_number"]),
+                    speciality=str(payload["speciality"]),
+                    joining_date=payload["joining_date"],  # type: ignore[arg-type]
+                    role_name=str(payload["role_name"]),
+                )
+            except ValueError as exc:
+                dialog.set_feedback(str(exc), tone="error")
+                continue
+
+            self._set_feedback("Staff member updated successfully.", tone="success")
+            self.staff_password_label.clear()
+            self.staff_password_label.hide()
+            self.refresh_data()
+            if self._on_staff_created is not None:
+                self._on_staff_created()
+            break
+
+    def _set_feedback(self, message: str, *, tone: str) -> None:
+        self.staff_feedback_label.setText(message)
+        self.staff_feedback_label.setVisible(bool(message))
+        self.staff_feedback_label.setProperty("tone", tone)
+        self.staff_feedback_label.style().unpolish(self.staff_feedback_label)
+        self.staff_feedback_label.style().polish(self.staff_feedback_label)
+        self.staff_feedback_label.update()
+
+
+class ItemEditorDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        store_name: str,
+        item_row: ItemRow | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._item_row = item_row
+        self.setModal(True)
+        self.setWindowTitle("Add Item" if item_row is None else "Item Details")
+        self.setMinimumSize(760, 360)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(16)
+
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(16)
+        header_copy = QVBoxLayout()
+        header_copy.setSpacing(6)
+
+        title = QLabel("Add Item" if item_row is None else "Edit Item")
+        title.setObjectName("SectionTitle")
+        copy = QLabel(
+            "Capture the item details in one screen. Changes update only the active store catalog."
+        )
+        copy.setObjectName("SectionCopy")
+        copy.setWordWrap(True)
+
+        header_copy.addWidget(title)
+        header_copy.addWidget(copy)
+
+        action_layout = QHBoxLayout()
+        action_layout.setSpacing(10)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setObjectName("SecondaryButton")
+        self.save_button = QPushButton("Add Item" if item_row is None else "Update Item")
+        self.save_button.setObjectName("ActionButton")
+        self.save_button.setMinimumHeight(42)
+        action_layout.addWidget(self.cancel_button)
+        action_layout.addWidget(self.save_button)
+
+        header_layout.addLayout(header_copy, stretch=1)
+        header_layout.addLayout(action_layout)
+
+        self.feedback_label = QLabel("")
+        self.feedback_label.setObjectName("StatusMessage")
+        self.feedback_label.setWordWrap(True)
+        self.feedback_label.hide()
+
+        content_layout = QHBoxLayout()
+        content_layout.setSpacing(16)
+
+        details_card = QFrame()
+        details_card.setObjectName("InnerCard")
+        details_layout = QVBoxLayout(details_card)
+        details_layout.setContentsMargins(18, 18, 18, 18)
+        details_layout.setSpacing(12)
+
+        details_title = QLabel("Catalog Details")
+        details_title.setObjectName("SectionTitle")
+
+        details_form = QFormLayout()
+        details_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        details_form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        details_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        details_form.setHorizontalSpacing(12)
+        details_form.setVerticalSpacing(12)
+
+        self.item_name_input = QLineEdit()
+        self.item_name_input.setPlaceholderText("Enter item name")
+        self.cost_input = QLineEdit()
+        self.cost_input.setPlaceholderText("0.00")
+        self.store_input = QLineEdit()
+        self.store_input.setReadOnly(True)
+
+        details_form.addRow(self._form_label("Item name"), self.item_name_input)
+        details_form.addRow(self._form_label("Cost"), self.cost_input)
+        details_form.addRow(self._form_label("Store"), self.store_input)
+
+        details_layout.addWidget(details_title)
+        details_layout.addLayout(details_form)
+        details_layout.addStretch(1)
+
+        metadata_card = QFrame()
+        metadata_card.setObjectName("InnerCard")
+        metadata_layout = QVBoxLayout(metadata_card)
+        metadata_layout.setContentsMargins(18, 18, 18, 18)
+        metadata_layout.setSpacing(12)
+
+        metadata_title = QLabel("Record Metadata")
+        metadata_title.setObjectName("SectionTitle")
+
+        metadata_form = QFormLayout()
+        metadata_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        metadata_form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        metadata_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        metadata_form.setHorizontalSpacing(12)
+        metadata_form.setVerticalSpacing(12)
+
+        self.created_on_input = QLineEdit()
+        self.created_on_input.setReadOnly(True)
+        self.updated_on_input = QLineEdit()
+        self.updated_on_input.setReadOnly(True)
+
+        metadata_form.addRow(self._form_label("Created on"), self.created_on_input)
+        metadata_form.addRow(self._form_label("Last updated"), self.updated_on_input)
+
+        metadata_layout.addWidget(metadata_title)
+        metadata_layout.addLayout(metadata_form)
+        metadata_layout.addStretch(1)
+
+        content_layout.addWidget(details_card, stretch=1)
+        content_layout.addWidget(metadata_card, stretch=1)
+
+        root.addLayout(header_layout)
+        root.addWidget(self.feedback_label)
+        root.addLayout(content_layout)
+
+        self.cancel_button.clicked.connect(self.reject)
+        self.save_button.clicked.connect(self._attempt_accept)
+
+        self._populate(store_name=store_name, item_row=item_row)
+
+    def payload(self) -> dict[str, str]:
+        return {
+            "item_name": self.item_name_input.text().strip(),
+            "cost_text": self.cost_input.text().strip(),
+        }
+
+    def set_feedback(self, message: str, *, tone: str) -> None:
+        self.feedback_label.setText(message)
+        self.feedback_label.setVisible(bool(message))
+        self.feedback_label.setProperty("tone", tone)
+        self.feedback_label.style().unpolish(self.feedback_label)
+        self.feedback_label.style().polish(self.feedback_label)
+        self.feedback_label.update()
+
+    def _populate(self, *, store_name: str, item_row: ItemRow | None) -> None:
+        self.set_feedback("", tone="success")
+        self.store_input.setText(store_name)
+        if item_row is None:
+            self.item_name_input.clear()
+            self.cost_input.clear()
+            self.created_on_input.setText("Will be set when the item is created")
+            self.updated_on_input.setText("Will be set when the item is created")
+            return
+
+        self.item_name_input.setText(item_row.item_name)
+        self.cost_input.setText(f"{item_row.cost:.2f}")
+        self.created_on_input.setText(item_row.created_on.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+        self.updated_on_input.setText(item_row.updated_on.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+
+    def _attempt_accept(self) -> None:
+        payload = self.payload()
+        if not payload["item_name"]:
+            self.set_feedback("Item name is required.", tone="error")
+            return
+        if not payload["cost_text"]:
+            self.set_feedback("Cost is required.", tone="error")
+            return
+        try:
+            cost = Decimal(payload["cost_text"])
+        except (InvalidOperation, ValueError):
+            self.set_feedback("Enter a valid numeric cost.", tone="error")
+            return
+        if cost < Decimal("0.00"):
+            self.set_feedback("Item cost cannot be negative.", tone="error")
+            return
+        self.accept()
+
+    def _form_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("FormLabel")
+        return label
+
+
+class StoreItemsCreateScreen(QWidget):
+    TABLE_HEADERS = (
+        "Item Name",
+        "Cost",
+        "Created On",
+        "Updated On",
+    )
+
+    def __init__(
+        self,
+        *,
+        user_management_service: AdminUserManagementService,
+        operations_service: OperationsService,
+        on_item_created: Callable[[], None] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._user_management_service = user_management_service
+        self._operations_service = operations_service
+        self._on_item_created = on_item_created
+        self._current_user_id: str | None = None
+        self._store_context: StoreDashboardContext | None = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(16)
+
+        toolbar = QHBoxLayout()
+        toolbar.setContentsMargins(0, 0, 0, 0)
+        toolbar.setSpacing(12)
+
+        self.add_item_button = QPushButton("Add Item")
+        self.add_item_button.setObjectName("ActionButton")
+        self.add_item_button.setMinimumHeight(44)
+
+        toolbar.addWidget(self.add_item_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        toolbar.addStretch(1)
+
+        self.item_feedback_label = QLabel("")
+        self.item_feedback_label.setObjectName("StatusMessage")
+        self.item_feedback_label.setWordWrap(True)
+        self.item_feedback_label.hide()
+
+        table_card = QFrame()
+        table_card.setObjectName("InnerCard")
+        table_layout = QVBoxLayout(table_card)
+        table_layout.setContentsMargins(22, 22, 22, 22)
+        table_layout.setSpacing(12)
+
+        title = QLabel("Store Items")
+        title.setObjectName("SectionTitle")
+        copy = QLabel(
+            "Double-click a row to review or update that item. This table only shows items for the active store."
+        )
+        copy.setObjectName("SectionCopy")
+        copy.setWordWrap(True)
+
+        self.items_table = QTableWidget(0, len(self.TABLE_HEADERS))
+        self.items_table.setObjectName("DashboardTable")
+        self.items_table.setHorizontalHeaderLabels(list(self.TABLE_HEADERS))
+        self.items_table.setAlternatingRowColors(True)
+        self.items_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.items_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.items_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.items_table.setSortingEnabled(True)
+        self.items_table.setShowGrid(False)
+        self.items_table.verticalHeader().setVisible(False)
+        self.items_table.verticalHeader().setDefaultSectionSize(38)
+        self.items_table.horizontalHeader().setStretchLastSection(False)
+        self.items_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.items_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.items_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.items_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+
+        table_layout.addWidget(title)
+        table_layout.addWidget(copy)
+        table_layout.addWidget(self.items_table, stretch=1)
+
+        root.addLayout(toolbar)
+        root.addWidget(self.item_feedback_label)
+        root.addWidget(table_card, stretch=1)
+
+        self.add_item_button.clicked.connect(self._open_add_item_dialog)
+        self.items_table.cellDoubleClicked.connect(self._open_item_dialog_for_row)
+        self.set_current_user_id(None)
+
+    def set_current_user_id(self, current_user_id: str | None) -> None:
+        self._current_user_id = current_user_id
+        self._store_context = self._user_management_service.get_store_dashboard_context_for_user(
+            current_user_id
+        )
+        self._set_feedback("", tone="success")
+        self.refresh_data()
+
+    def refresh_data(self) -> None:
+        self.items_table.setSortingEnabled(False)
+        self.items_table.clearSpans()
+        self.items_table.clearContents()
+        if self._store_context is None:
+            self.add_item_button.setEnabled(False)
+            self.items_table.setRowCount(1)
+            self.items_table.setSpan(0, 0, 1, self.items_table.columnCount())
+            empty_item = QTableWidgetItem(
+                "Sign in with a store admin account to manage items for a store."
+            )
+            empty_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.items_table.setItem(0, 0, empty_item)
+            for column_index in range(1, self.items_table.columnCount()):
+                self.items_table.setItem(0, column_index, QTableWidgetItem(""))
+            return
+
+        self.add_item_button.setEnabled(True)
+        item_rows = self._operations_service.list_items(store_id=self._store_context.store_id)
+        if not item_rows:
+            self.items_table.setRowCount(1)
+            self.items_table.setSpan(0, 0, 1, self.items_table.columnCount())
+            empty_item = QTableWidgetItem(
+                "No items created yet. Use 'Add Item' to create the first one."
+            )
+            empty_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.items_table.setItem(0, 0, empty_item)
+            for column_index in range(1, self.items_table.columnCount()):
+                self.items_table.setItem(0, column_index, QTableWidgetItem(""))
+            return
+
+        self.items_table.setRowCount(len(item_rows))
+        for row_index, item_row in enumerate(item_rows):
+            row_values = (
+                item_row.item_name,
+                f"INR {item_row.cost:,.2f}",
+                item_row.created_on.astimezone(timezone.utc).strftime("%Y-%m-%d"),
+                item_row.updated_on.astimezone(timezone.utc).strftime("%Y-%m-%d"),
+            )
+            for column_index, value in enumerate(row_values):
+                item = QTableWidgetItem(value)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                item.setData(Qt.ItemDataRole.UserRole, item_row.item_id)
+                alignment = (
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    if column_index == 1
+                    else Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                )
+                item.setTextAlignment(alignment)
+                self.items_table.setItem(row_index, column_index, item)
+        self.items_table.setSortingEnabled(True)
+        self.items_table.sortItems(0, Qt.SortOrder.AscendingOrder)
+
+    def _open_add_item_dialog(self) -> None:
+        if self._store_context is None:
+            self._set_feedback("Store context is required before creating an item.", tone="error")
+            return
+
+        dialog = ItemEditorDialog(
+            store_name=self._store_context.store_name,
+            parent=self,
+        )
+        while dialog.exec() == QDialog.DialogCode.Accepted:
+            payload = dialog.payload()
+            try:
+                self._operations_service.create_item(
+                    store_id=self._store_context.store_id,
+                    item_name=payload["item_name"],
+                    cost=Decimal(payload["cost_text"]),
+                )
+            except ValueError as exc:
+                dialog.set_feedback(str(exc), tone="error")
+                continue
+
+            self._set_feedback("Item created successfully.", tone="success")
+            self.refresh_data()
+            if self._on_item_created is not None:
+                self._on_item_created()
+            break
+
+    def _open_item_dialog_for_row(self, row: int, _column: int) -> None:
+        if self._store_context is None:
+            return
+        item_cell = self.items_table.item(row, 0)
+        if item_cell is None:
+            return
+        item_id = item_cell.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(item_id, str):
+            return
+
+        item_row = self._operations_service.get_item(
+            store_id=self._store_context.store_id,
+            item_id=item_id,
+        )
+        if item_row is None:
+            self._set_feedback("The selected item could not be loaded.", tone="error")
+            return
+
+        dialog = ItemEditorDialog(
+            store_name=self._store_context.store_name,
+            item_row=item_row,
+            parent=self,
+        )
+        while dialog.exec() == QDialog.DialogCode.Accepted:
+            payload = dialog.payload()
+            try:
+                self._operations_service.update_item(
+                    store_id=self._store_context.store_id,
+                    item_id=item_id,
+                    item_name=payload["item_name"],
+                    cost=Decimal(payload["cost_text"]),
+                )
+            except ValueError as exc:
+                dialog.set_feedback(str(exc), tone="error")
+                continue
+
+            self._set_feedback("Item updated successfully.", tone="success")
+            self.refresh_data()
+            if self._on_item_created is not None:
+                self._on_item_created()
+            break
+
+    def _set_feedback(self, message: str, *, tone: str) -> None:
+        self.item_feedback_label.setText(message)
+        self.item_feedback_label.setVisible(bool(message))
+        self.item_feedback_label.setProperty("tone", tone)
+        self.item_feedback_label.style().unpolish(self.item_feedback_label)
+        self.item_feedback_label.style().polish(self.item_feedback_label)
+        self.item_feedback_label.update()
+
+
 class MainWindow(QMainWindow):
+    FOOTER_TEXT = "Assembled @ EnTech Garage, Pune | enatech.garage.gmail.com (c) 2026 "
+
     def __init__(
         self,
         app_name: str,
@@ -262,6 +1351,7 @@ class MainWindow(QMainWindow):
         audit_service: AuditService,
         audit_review_service: AuditReviewService,
         admin_user_management_service: AdminUserManagementService,
+        operations_service: OperationsService,
         app_env: str = "development",
     ) -> None:
         super().__init__()
@@ -274,6 +1364,7 @@ class MainWindow(QMainWindow):
         self._audit_service = audit_service
         self._audit_review_service = audit_review_service
         self._admin_user_management_service = admin_user_management_service
+        self._operations_service = operations_service
         self._current_user_id: str | None = None
         self._session_state: SessionState | None = None
         self._pending_password_reset: PendingPasswordReset | None = None
@@ -294,7 +1385,19 @@ class MainWindow(QMainWindow):
         self._pages.addWidget(self.forgot_password_page)
         self._pages.addWidget(self.password_reset_page)
         self._pages.addWidget(self.workspace_page)
-        self.setCentralWidget(self._pages)
+
+        self.footer_label = QLabel(self.FOOTER_TEXT)
+        self.footer_label.setObjectName("FooterLabel")
+        self.footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.footer_label.setWordWrap(True)
+
+        central = QWidget(self)
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self._pages, stretch=1)
+        central_layout.addWidget(self.footer_label)
+        self.setCentralWidget(central)
 
         self._apply_styles()
         self._reset_workspace_state()
@@ -719,8 +1822,8 @@ class MainWindow(QMainWindow):
         banner_copy = QVBoxLayout()
         banner_copy.setSpacing(8)
 
-        workspace_eyebrow = QLabel("SESSION ACTIVE")
-        workspace_eyebrow.setObjectName("WorkspaceEyebrow")
+        self.workspace_eyebrow = QLabel("SESSION ACTIVE")
+        self.workspace_eyebrow.setObjectName("WorkspaceEyebrow")
 
         self.workspace_heading = QLabel("Secure workspace")
         self.workspace_heading.setObjectName("WorkspaceTitle")
@@ -731,7 +1834,7 @@ class MainWindow(QMainWindow):
         self.workspace_summary_label.setObjectName("WorkspaceSubtitle")
         self.workspace_summary_label.setWordWrap(True)
 
-        banner_copy.addWidget(workspace_eyebrow)
+        banner_copy.addWidget(self.workspace_eyebrow)
         banner_copy.addWidget(self.workspace_heading)
         banner_copy.addWidget(self.workspace_summary_label)
 
@@ -803,6 +1906,8 @@ class MainWindow(QMainWindow):
 
         self.nav_home_button = QPushButton("Home")
         self.nav_admin_button = QPushButton("Admin Console")
+        self.nav_create_staff_button = QPushButton("Create Staff")
+        self.nav_create_items_button = QPushButton("Create Items")
         self.nav_billing_button = QPushButton("Billing")
         self.logout_button = QPushButton("Sign out")
         self.logout_button.setObjectName("SecondaryButton")
@@ -811,6 +1916,8 @@ class MainWindow(QMainWindow):
         self._nav_buttons = {
             "home": self.nav_home_button,
             "admin": self.nav_admin_button,
+            "create_staff": self.nav_create_staff_button,
+            "create_items": self.nav_create_items_button,
             "billing": self.nav_billing_button,
         }
         for route_key, button in self._nav_buttons.items():
@@ -853,10 +1960,23 @@ class MainWindow(QMainWindow):
             user_management_service=self._admin_user_management_service,
             parent=self,
         )
+        self.create_staff_page = StoreStaffCreateScreen(
+            user_management_service=self._admin_user_management_service,
+            on_staff_created=self._handle_store_staff_created,
+            parent=self,
+        )
+        self.create_items_page = StoreItemsCreateScreen(
+            user_management_service=self._admin_user_management_service,
+            operations_service=self._operations_service,
+            on_item_created=self._handle_store_item_created,
+            parent=self,
+        )
         self.billing_page = self._build_billing_page()
 
         self.route_stack.addWidget(self.home_page)
         self.route_stack.addWidget(self.admin_page)
+        self.route_stack.addWidget(self.create_staff_page)
+        self.route_stack.addWidget(self.create_items_page)
         self.route_stack.addWidget(self.billing_page)
 
         self._route_config = {
@@ -869,6 +1989,16 @@ class MainWindow(QMainWindow):
                 "title": "Admin Console",
                 "subtitle": "Manage users, roles, permissions, and audit review in the same workspace.",
                 "widget": self.admin_page,
+            },
+            "create_staff": {
+                "title": "Create Staff",
+                "subtitle": "Create new store staff accounts for this store.",
+                "widget": self.create_staff_page,
+            },
+            "create_items": {
+                "title": "Create Items",
+                "subtitle": "Create store items and keep the item catalog current.",
+                "widget": self.create_items_page,
             },
             "billing": {
                 "title": "Billing",
@@ -903,11 +2033,21 @@ class MainWindow(QMainWindow):
         superadmin_layout.setContentsMargins(0, 0, 0, 0)
         superadmin_layout.addStretch(1)
 
-        self.store_home_page = StoreProfileHomeScreen(
+        self.store_home_page = StoreAdminDashboardScreen(
             user_management_service=self._admin_user_management_service,
-            on_store_updated=self._handle_store_profile_updated,
+            operations_service=self._operations_service,
             parent=self,
         )
+
+        self.store_manager_home_page = QWidget()
+        manager_layout = QVBoxLayout(self.store_manager_home_page)
+        manager_layout.setContentsMargins(0, 0, 0, 0)
+        manager_layout.addStretch(1)
+
+        self.store_worker_home_page = QWidget()
+        worker_layout = QVBoxLayout(self.store_worker_home_page)
+        worker_layout.setContentsMargins(0, 0, 0, 0)
+        worker_layout.addStretch(1)
 
         self.default_home_page = QWidget()
         default_layout = QVBoxLayout(self.default_home_page)
@@ -982,6 +2122,8 @@ class MainWindow(QMainWindow):
 
         self.home_mode_stack.addWidget(self.superadmin_home_page)
         self.home_mode_stack.addWidget(self.store_home_page)
+        self.home_mode_stack.addWidget(self.store_manager_home_page)
+        self.home_mode_stack.addWidget(self.store_worker_home_page)
         self.home_mode_stack.addWidget(self.default_home_page)
         layout.addWidget(self.home_mode_stack)
         return page
@@ -1213,7 +2355,7 @@ class MainWindow(QMainWindow):
 
         expiry = expires_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         self._refresh_store_scoped_shell(identifier=identifier, expiry=expiry)
-        self._refresh_home_route_content()
+        self._refresh_store_admin_views()
         if password_reset_required:
             self._set_status_label(
                 self.workspace_notice,
@@ -1234,17 +2376,42 @@ class MainWindow(QMainWindow):
 
         self._sync_route_presentation()
         context = self._authorization_service.build_context(self._current_user_id)
-        nav_checks = {
-            "home": "nav:home",
-            "admin": "nav:admin",
-            "billing": "nav:billing",
-        }
+        store_scoped_mode = self._is_store_scoped_workspace_mode()
+        store_admin_mode = self._is_store_admin_mode()
 
-        for route_key, permission in nav_checks.items():
-            button = self._nav_buttons[route_key]
-            is_allowed = self._authorization_guard.can(permission=permission, context=context)
+        if store_scoped_mode:
+            route_permissions = {
+                "home": True,
+                "admin": self._authorization_guard.can(permission="nav:admin", context=context),
+                "create_staff": store_admin_mode and self._admin_user_management_service.can_actor_create_users(
+                    self._current_user_id
+                ),
+                "create_items": store_admin_mode,
+                "billing": False,
+            }
+            visible_routes = {"home", "admin", "create_staff", "create_items"}
+        else:
+            route_permissions = {
+                "home": self._authorization_guard.can(permission="nav:home", context=context),
+                "admin": self._authorization_guard.can(permission="nav:admin", context=context),
+                "create_staff": False,
+                "create_items": False,
+                "billing": self._authorization_guard.can(permission="nav:billing", context=context),
+            }
+            visible_routes = {"home", "admin", "billing"}
+
+        for route_key, button in self._nav_buttons.items():
+            is_visible = route_key in visible_routes
+            button.setVisible(is_visible)
+            is_allowed = route_permissions.get(route_key, False)
             button.setEnabled(is_allowed)
-            button.setToolTip("" if is_allowed else f"Access denied by default for {permission}")
+            if route_key == "create_staff":
+                tooltip_key = "store staff creation"
+            elif route_key == "create_items":
+                tooltip_key = "store item creation"
+            else:
+                tooltip_key = route_key
+            button.setToolTip("" if is_allowed else f"Access denied for {tooltip_key}.")
 
         report_allowed = self._authorization_guard.can(permission="report:run", context=context)
         self.report_button.setEnabled(report_allowed)
@@ -1259,7 +2426,12 @@ class MainWindow(QMainWindow):
             and self._nav_buttons["admin"].isEnabled()
         ):
             return "admin"
-        for route_key in ("home", "admin", "billing"):
+        route_order = (
+            ("home", "admin", "create_staff", "create_items")
+            if self._is_store_scoped_workspace_mode()
+            else ("home", "admin", "billing")
+        )
+        for route_key in route_order:
             if self._nav_buttons[route_key].isEnabled():
                 return route_key
         return "home"
@@ -1286,6 +2458,7 @@ class MainWindow(QMainWindow):
 
         if clear_notice:
             self._set_status_label(self.workspace_notice, "", tone="success")
+        self._update_workspace_chrome_visibility()
 
     def _run_operational_report(self) -> None:
         if self._current_user_id is None:
@@ -1307,6 +2480,8 @@ class MainWindow(QMainWindow):
         self._pending_password_reset = None
         self._store_dashboard_context = None
         self.admin_page.set_current_user_id(None)
+        self.create_staff_page.set_current_user_id(None)
+        self.create_items_page.set_current_user_id(None)
         self.identifier_input.clear()
         self.password_input.clear()
         self.recovery_identifier_input.clear()
@@ -1341,6 +2516,8 @@ class MainWindow(QMainWindow):
         self.home_store_details_label.setText("")
         self.store_home_page.clear_context()
         self.home_mode_stack.setCurrentWidget(self.default_home_page)
+        self.create_staff_page.set_current_user_id(None)
+        self.create_items_page.set_current_user_id(None)
         self.home_session_label.setText(
             "Sign in to populate session metadata and route-aware workspace details."
         )
@@ -1352,8 +2529,14 @@ class MainWindow(QMainWindow):
         for button in self._nav_buttons.values():
             button.setEnabled(False)
             button.setChecked(False)
+        self.nav_home_button.show()
+        self.nav_admin_button.show()
+        self.nav_billing_button.show()
+        self.nav_create_staff_button.hide()
+        self.nav_create_items_button.hide()
         self.report_button.setEnabled(False)
         self._active_route = "home"
+        self._update_workspace_chrome_visibility()
 
     def _reload_admin_ui(self) -> None:
         if self._app_env.lower() != "development" or self._session_state is None:
@@ -1389,6 +2572,7 @@ class MainWindow(QMainWindow):
         self.route_stack.removeWidget(previous_admin_page)
         previous_admin_page.deleteLater()
 
+        self.admin_page.set_current_user_id(self._current_user_id)
         self._sync_route_presentation()
         self._render_authorized_navigation()
         self._navigate(previous_route, clear_notice=False)
@@ -1403,10 +2587,29 @@ class MainWindow(QMainWindow):
             self._current_user_id is not None
             and self._admin_user_management_service.role_name_for_user(self._current_user_id) == "Superadmin"
         )
+        store_admin_mode = self._is_store_admin_mode()
+        store_manager_mode = self._is_store_manager_mode()
+        store_worker_mode = self._is_store_worker_mode()
         has_store_scope = self._store_dashboard_context is not None
         if is_superadmin:
             self.nav_home_button.setText("Home")
             self._route_config["home"]["title"] = "Home"
+            self._route_config["home"]["subtitle"] = ""
+        elif store_admin_mode:
+            self.nav_home_button.setText("Store Dashboard")
+            self._route_config["home"]["title"] = "Store Dashboard"
+            self._route_config["home"]["subtitle"] = (
+                "Review store staff, items, and reserved workspace cards from this store dashboard."
+            )
+        elif store_manager_mode:
+            self.nav_home_button.setText("Store Dashboard")
+            self._route_config["home"]["title"] = "Store Dashboard"
+            self._route_config["home"]["subtitle"] = ""
+        elif store_worker_mode:
+            worker_name = self._admin_user_management_service.display_name_for_user(self._current_user_id).strip()
+            dashboard_name = f"{worker_name} Dashboard" if worker_name else "Worker Dashboard"
+            self.nav_home_button.setText(dashboard_name)
+            self._route_config["home"]["title"] = dashboard_name
             self._route_config["home"]["subtitle"] = ""
         elif has_store_scope:
             self.nav_home_button.setText("Store Dashboard")
@@ -1432,6 +2635,8 @@ class MainWindow(QMainWindow):
         self._route_config["admin"]["subtitle"] = (
             "Manage users, roles, permissions, and audit review in the same workspace."
         )
+        self.nav_create_staff_button.setText("Create Staff")
+        self.nav_create_items_button.setText("Create Items")
         self._refresh_home_route_content()
 
     def _refresh_store_scoped_shell(self, *, identifier: str, expiry: str) -> None:
@@ -1503,39 +2708,97 @@ class MainWindow(QMainWindow):
             self.home_mode_stack.setCurrentWidget(self.superadmin_home_page)
             return
 
-        if self._store_dashboard_context is not None:
-            store_record = self._admin_user_management_service.get_store_for_user(self._current_user_id)
-            if store_record is not None:
-                editable = (
-                    self._admin_user_management_service.role_name_for_user(self._current_user_id) == "Admin"
-                )
-                self.store_home_page.set_store_context(
-                    current_user_id=self._current_user_id,
-                    store_record=store_record,
-                    editable=editable,
-                )
-                self.home_mode_stack.setCurrentWidget(self.store_home_page)
-                return
+        if self._is_store_admin_mode() and self._store_dashboard_context is not None:
+            self.store_home_page.set_context(
+                current_user_id=self._current_user_id,
+                store_context=self._store_dashboard_context,
+            )
+            self.home_mode_stack.setCurrentWidget(self.store_home_page)
+            return
+
+        if self._is_store_manager_mode() and self._store_dashboard_context is not None:
+            self.store_home_page.clear_context()
+            self.home_mode_stack.setCurrentWidget(self.store_manager_home_page)
+            return
+
+        if self._is_store_worker_mode() and self._store_dashboard_context is not None:
+            self.store_home_page.clear_context()
+            self.home_mode_stack.setCurrentWidget(self.store_worker_home_page)
+            return
 
         self.store_home_page.clear_context()
         self.home_mode_stack.setCurrentWidget(self.default_home_page)
 
-    def _handle_store_profile_updated(self, updated_record: AdminStoreRecord) -> None:
+    def _refresh_store_admin_views(self) -> None:
+        self.create_staff_page.set_current_user_id(self._current_user_id)
+        self.create_items_page.set_current_user_id(self._current_user_id)
         if self._current_user_id is None or self._session_state is None:
             return
+        self._refresh_store_admin_shell()
+        self.admin_page.set_current_user_id(self._current_user_id)
 
-        self._store_dashboard_context = (
-            self._admin_user_management_service.get_store_dashboard_context_for_user(
-                self._current_user_id
-            )
+    def _refresh_store_admin_shell(self) -> None:
+        if self._current_user_id is None or self._session_state is None:
+            return
+        self._store_dashboard_context = self._admin_user_management_service.get_store_dashboard_context_for_user(
+            self._current_user_id
         )
         expiry = self._session_state.expires_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         self._refresh_store_scoped_shell(identifier=self._session_state.identifier, expiry=expiry)
         self._refresh_home_route_content()
-        self._set_status_label(
-            self.workspace_notice,
-            f"Updated store profile for {updated_record.store_name}.",
-            tone="success",
+
+    def _handle_store_staff_created(self) -> None:
+        if self._current_user_id is None or self._session_state is None:
+            return
+        self._refresh_store_admin_shell()
+        self.admin_page.set_current_user_id(self._current_user_id)
+
+    def _handle_store_item_created(self) -> None:
+        if self._current_user_id is None or self._session_state is None:
+            return
+        self._refresh_store_admin_shell()
+
+    def _update_workspace_chrome_visibility(self) -> None:
+        store_scoped_mode = self._is_store_scoped_workspace_mode()
+        store_dashboard_mode = store_scoped_mode and self._active_route == "home"
+
+        self.workspace_eyebrow.setVisible(not store_scoped_mode)
+        self.sidebar_store_card.setVisible(not store_scoped_mode)
+        self.page_eyebrow.setVisible(not store_dashboard_mode)
+        self.page_title_label.setVisible(not store_dashboard_mode)
+        self.page_subtitle_label.setVisible(
+            (not store_dashboard_mode) and bool(self.page_subtitle_label.text())
+        )
+        self.workspace_notice.setVisible(
+            (not store_dashboard_mode) and bool(self.workspace_notice.text())
+        )
+
+    def _is_store_admin_mode(self) -> bool:
+        return (
+            self._store_dashboard_context is not None
+            and self._current_user_id is not None
+            and self._admin_user_management_service.role_name_for_user(self._current_user_id) == "Admin"
+        )
+
+    def _is_store_manager_mode(self) -> bool:
+        return (
+            self._store_dashboard_context is not None
+            and self._current_user_id is not None
+            and self._admin_user_management_service.role_name_for_user(self._current_user_id) == "Manager"
+        )
+
+    def _is_store_worker_mode(self) -> bool:
+        return (
+            self._store_dashboard_context is not None
+            and self._current_user_id is not None
+            and self._admin_user_management_service.role_name_for_user(self._current_user_id) == "Worker"
+        )
+
+    def _is_store_scoped_workspace_mode(self) -> bool:
+        return (
+            self._is_store_admin_mode()
+            or self._is_store_manager_mode()
+            or self._is_store_worker_mode()
         )
 
     def _set_loading(self, is_loading: bool) -> None:
@@ -1700,6 +2963,43 @@ class MainWindow(QMainWindow):
                 border: 1px solid #dccdbd;
                 border-radius: 18px;
             }
+            QFrame#DashboardListRow {
+                background-color: #fcf9f5;
+                border: 1px solid #ded2c3;
+                border-radius: 14px;
+            }
+            QTableWidget#DashboardTable {
+                background-color: #fcf9f5;
+                alternate-background-color: #f8f2eb;
+                border: 1px solid #ded2c3;
+                border-radius: 14px;
+                color: #1f2933;
+                gridline-color: #eadfd2;
+                outline: none;
+            }
+            QTableWidget#DashboardTable::item {
+                padding: 8px 12px;
+                border-bottom: 1px solid #eadfd2;
+            }
+            QTableWidget#DashboardTable::item:selected {
+                background-color: #ddebe8;
+                color: #1f2933;
+            }
+            QTableWidget#DashboardTable QHeaderView::section {
+                background-color: #e8ddd0;
+                color: #3d3025;
+                border: none;
+                border-bottom: 1px solid #d6c6b5;
+                padding: 10px 12px;
+                font-size: 12px;
+                font-weight: 700;
+                text-align: left;
+            }
+            QTableWidget#DashboardTable QTableCornerButton::section {
+                background-color: #e8ddd0;
+                border: none;
+                border-bottom: 1px solid #d6c6b5;
+            }
             QLabel#CardEyebrow {
                 color: #8b5a2b;
             }
@@ -1725,6 +3025,19 @@ class MainWindow(QMainWindow):
                 font-weight: 700;
                 color: #1f2933;
             }
+            QLabel#DashboardRowPrimary {
+                font-size: 14px;
+                font-weight: 700;
+                color: #1f2933;
+            }
+            QLabel#DashboardRowSecondary {
+                font-size: 12px;
+                color: #52606d;
+            }
+            QLabel#DashboardPlaceholder {
+                font-size: 14px;
+                color: #52606d;
+            }
             QLabel#PageTitle {
                 font-size: 28px;
             }
@@ -1732,6 +3045,14 @@ class MainWindow(QMainWindow):
                 font-size: 11px;
                 font-weight: 700;
                 color: #8b5a2b;
+            }
+            QLabel#FooterLabel {
+                background-color: #e7ddd1;
+                border-top: 1px solid #d2c1ad;
+                color: #5c5349;
+                font-size: 12px;
+                font-weight: 600;
+                padding: 10px 18px;
             }
             QLabel#SessionBadge {
                 background-color: rgba(255, 255, 255, 0.14);
@@ -1777,6 +3098,23 @@ class MainWindow(QMainWindow):
             }
             QLineEdit:focus {
                 border: 1px solid #8b5a2b;
+            }
+            QComboBox, QDateEdit {
+                min-height: 42px;
+                padding: 0 12px;
+                border: 1px solid #cbb9a3;
+                border-radius: 12px;
+                background-color: #ffffff;
+                color: #1f2933;
+            }
+            QComboBox:focus, QDateEdit:focus {
+                border: 1px solid #8b5a2b;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #ffffff;
+                color: #1f2933;
+                selection-background-color: #ddebe8;
+                selection-color: #1f2933;
             }
             QPushButton {
                 min-width: 120px;

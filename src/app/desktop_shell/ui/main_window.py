@@ -44,6 +44,7 @@ from app.authorization.services import (
     ReportingService,
 )
 from app.desktop_shell.ui.admin_management import AccessControlWorkspace
+from app.desktop_shell.ui.manager_customer import StoreManagerCustomerDashboardScreen
 from app.operations.services import ItemRow, OperationsService
 from app.platform.audit import AuditReviewService, AuditService
 
@@ -2039,10 +2040,11 @@ class MainWindow(QMainWindow):
             parent=self,
         )
 
-        self.store_manager_home_page = QWidget()
-        manager_layout = QVBoxLayout(self.store_manager_home_page)
-        manager_layout.setContentsMargins(0, 0, 0, 0)
-        manager_layout.addStretch(1)
+        self.store_manager_home_page = StoreManagerCustomerDashboardScreen(
+            user_management_service=self._admin_user_management_service,
+            operations_service=self._operations_service,
+            parent=self,
+        )
 
         self.store_worker_home_page = QWidget()
         worker_layout = QVBoxLayout(self.store_worker_home_page)
@@ -2515,6 +2517,7 @@ class MainWindow(QMainWindow):
         )
         self.home_store_details_label.setText("")
         self.store_home_page.clear_context()
+        self.store_manager_home_page.clear_context()
         self.home_mode_stack.setCurrentWidget(self.default_home_page)
         self.create_staff_page.set_current_user_id(None)
         self.create_items_page.set_current_user_id(None)
@@ -2718,6 +2721,10 @@ class MainWindow(QMainWindow):
 
         if self._is_store_manager_mode() and self._store_dashboard_context is not None:
             self.store_home_page.clear_context()
+            self.store_manager_home_page.set_context(
+                current_user_id=self._current_user_id,
+                store_context=self._store_dashboard_context,
+            )
             self.home_mode_stack.setCurrentWidget(self.store_manager_home_page)
             return
 

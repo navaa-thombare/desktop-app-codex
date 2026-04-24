@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, Numeric, String, func, select
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, func, inspect, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
@@ -16,10 +16,12 @@ class CustomerModel(Base):
     __tablename__ = "ops_customers"
 
     customer_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    store_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
     full_name: Mapped[str] = mapped_column(String(150), nullable=False)
     mobile: Mapped[str] = mapped_column(String(50), nullable=False)
     email: Mapped[str] = mapped_column(String(150), nullable=False)
     address: Mapped[str] = mapped_column(String(240), nullable=False)
+    is_whatsapp: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     total_billing: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     received_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
@@ -44,10 +46,38 @@ class OrderModel(Base):
     order_total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     status: Mapped[str] = mapped_column(String(40), nullable=False)
     notes: Mapped[str] = mapped_column(String(240), nullable=False, default="")
+    due_on: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    priority: Mapped[str] = mapped_column(String(40), nullable=False, default="Medium")
+    created_by: Mapped[str] = mapped_column(String(150), nullable=False, default="")
     created_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     customer: Mapped[CustomerModel] = relationship(back_populates="orders")
+    items: Mapped[list["OrderItemModel"]] = relationship(
+        back_populates="order",
+        cascade="all, delete-orphan",
+    )
+
+
+class OrderItemModel(Base):
+    __tablename__ = "ops_order_items"
+
+    order_item_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    order_id: Mapped[str] = mapped_column(
+        ForeignKey("ops_orders.order_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    item_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    item_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    measurements: Mapped[str] = mapped_column(String(240), nullable=False, default="")
+    rate: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    line_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(40), nullable=False, default="NEW")
+    updated_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_by: Mapped[str] = mapped_column(String(150), nullable=False, default="")
+
+    order: Mapped[OrderModel] = relationship(back_populates="items")
 
 
 class ItemModel(Base):
@@ -64,10 +94,12 @@ class ItemModel(Base):
 @dataclass(frozen=True)
 class CustomerRow:
     customer_id: str
+    store_id: str | None
     full_name: str
     mobile: str
     email: str
     address: str
+    is_whatsapp: bool
     created_on: datetime
     total_billing: Decimal
     received_amount: Decimal
@@ -84,6 +116,9 @@ class OrderRow:
     order_total: Decimal
     status: str
     notes: str
+    due_on: datetime | None
+    priority: str
+    created_by: str
     created_on: datetime
     updated_on: datetime
 
@@ -96,6 +131,53 @@ class ItemRow:
     cost: Decimal
     created_on: datetime
     updated_on: datetime
+
+
+@dataclass(frozen=True)
+class OrderItemCreateInput:
+    item_id: str
+    item_name: str
+    quantity: int
+    measurements: str
+    rate: Decimal
+    status: str
+    updated_on: datetime
+    updated_by: str
+
+    @property
+    def line_amount(self) -> Decimal:
+        return (self.rate * Decimal(self.quantity)).quantize(Decimal("0.01"))
+
+
+@dataclass(frozen=True)
+class CustomerOrderCreateInput:
+    title: str
+    created_by: str
+    due_on: datetime | None
+    priority: str
+    status: str
+    paid_amount: Decimal
+    items: tuple[OrderItemCreateInput, ...]
+
+
+@dataclass(frozen=True)
+class CustomerSummaryRow:
+    customer_id: str
+    full_name: str
+    mobile: str
+    email: str
+    last_order_on: datetime | None
+    balance_amount: Decimal
+
+
+@dataclass(frozen=True)
+class OrderQueueRow:
+    customer_name: str
+    order_date: datetime
+    due_date: datetime | None
+    priority: str
+    item_name: str
+    status: str
 
 
 class OperationsService:
@@ -114,6 +196,7 @@ class OperationsService:
         self._engine = engine
         self._session_factory = session_factory
         Base.metadata.create_all(bind=self._engine)
+        self._ensure_schema_columns()
         self._seed_if_needed()
 
     def list_customers(self) -> tuple[CustomerRow, ...]:
@@ -125,6 +208,122 @@ class OperationsService:
         with self._session_factory() as session:
             rows = session.scalars(select(OrderModel).order_by(OrderModel.updated_on.desc())).all()
             return tuple(self._to_order_row(row) for row in rows)
+
+    def count_customer_summaries_for_store(self, *, store_id: str) -> int:
+        normalized_store_id = store_id.strip()
+        if not normalized_store_id:
+            return 0
+
+        with self._session_factory() as session:
+            return int(
+                session.scalar(
+                    select(func.count()).select_from(CustomerModel).where(
+                        CustomerModel.store_id == normalized_store_id
+                    )
+                )
+                or 0
+            )
+
+    def list_customer_summaries_for_store(
+        self,
+        *,
+        store_id: str,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> tuple[CustomerSummaryRow, ...]:
+        normalized_store_id = store_id.strip()
+        if not normalized_store_id:
+            return ()
+
+        with self._session_factory() as session:
+            statement = (
+                select(CustomerModel)
+                .where(CustomerModel.store_id == normalized_store_id)
+                .order_by(CustomerModel.full_name.asc())
+            )
+            if limit is not None:
+                statement = statement.limit(max(0, limit)).offset(max(0, offset))
+            rows = session.scalars(statement).all()
+            return tuple(self._to_customer_summary_row(row) for row in rows)
+
+    def count_search_customer_summaries_for_store(self, *, store_id: str, query: str) -> int:
+        normalized_store_id = store_id.strip()
+        normalized_query = query.strip().lower()
+        if not normalized_store_id:
+            return 0
+        if not normalized_query:
+            return self.count_customer_summaries_for_store(store_id=normalized_store_id)
+
+        with self._session_factory() as session:
+            return int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(CustomerModel)
+                    .where(CustomerModel.store_id == normalized_store_id)
+                    .where(self._customer_search_filter(normalized_query))
+                )
+                or 0
+            )
+
+    def search_customer_summaries_for_store(
+        self,
+        *,
+        store_id: str,
+        query: str,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> tuple[CustomerSummaryRow, ...]:
+        normalized_store_id = store_id.strip()
+        normalized_query = query.strip().lower()
+        if not normalized_store_id:
+            return ()
+        if not normalized_query:
+            return self.list_customer_summaries_for_store(
+                store_id=normalized_store_id,
+                limit=limit,
+                offset=offset,
+            )
+
+        with self._session_factory() as session:
+            statement = (
+                select(CustomerModel)
+                .where(CustomerModel.store_id == normalized_store_id)
+                .where(self._customer_search_filter(normalized_query))
+                .order_by(CustomerModel.full_name.asc())
+            )
+            if limit is not None:
+                statement = statement.limit(max(0, limit)).offset(max(0, offset))
+            rows = session.scalars(statement).all()
+            return tuple(self._to_customer_summary_row(row) for row in rows)
+
+    def list_order_queue_for_store(self, *, store_id: str) -> tuple[OrderQueueRow, ...]:
+        normalized_store_id = store_id.strip()
+        if not normalized_store_id:
+            return ()
+
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(CustomerModel, OrderModel, OrderItemModel)
+                .join(OrderModel, OrderModel.customer_id == CustomerModel.customer_id)
+                .join(OrderItemModel, OrderItemModel.order_id == OrderModel.order_id)
+                .where(CustomerModel.store_id == normalized_store_id)
+                .order_by(
+                    (OrderModel.status != "NEW").asc(),
+                    OrderModel.created_on.desc(),
+                    OrderItemModel.order_item_id.asc(),
+                )
+            ).all()
+            return tuple(
+                OrderQueueRow(
+                    customer_name=customer.full_name,
+                    order_date=self._ensure_utc(order.created_on),
+                    due_date=self._ensure_optional_utc(order.due_on),
+                    priority=order.priority,
+                    item_name=item.item_name,
+                    status=item.status or order.status,
+                )
+                for customer, order, item in rows
+            )
 
     def list_items(self, *, store_id: str) -> tuple[ItemRow, ...]:
         normalized_store_id = store_id.strip()
@@ -281,6 +480,75 @@ class OperationsService:
             session.commit()
             return customer_id
 
+    def create_customer_with_orders(
+        self,
+        *,
+        store_id: str,
+        full_name: str,
+        mobile: str,
+        email: str,
+        address: str,
+        is_whatsapp: bool,
+        orders: list[CustomerOrderCreateInput],
+    ) -> str:
+        normalized_store_id = store_id.strip()
+        normalized_full_name = full_name.strip()
+        normalized_mobile = mobile.strip()
+        normalized_email = email.strip().lower()
+        normalized_address = address.strip()
+        if not normalized_store_id:
+            raise ValueError("Store context is required before creating a customer.")
+        if not normalized_full_name:
+            raise ValueError("Full name is required.")
+        if not normalized_mobile:
+            raise ValueError("Contact number is required.")
+        if not normalized_address:
+            raise ValueError("Address is required.")
+        if not orders:
+            raise ValueError("At least one order is required.")
+
+        now = datetime.now(tz=timezone.utc)
+        customer_id = f"CUS-{now.strftime('%Y%m%d%H%M%S')}-{now.microsecond:06d}"
+        with self._session_factory() as session:
+            existing_customer = session.scalar(
+                select(CustomerModel).where(
+                    CustomerModel.store_id == normalized_store_id,
+                    CustomerModel.mobile == normalized_mobile,
+                )
+            )
+            if existing_customer is not None:
+                raise ValueError("A customer with this contact number already exists for this store.")
+
+            customer = CustomerModel(
+                customer_id=customer_id,
+                store_id=normalized_store_id,
+                full_name=normalized_full_name,
+                mobile=normalized_mobile,
+                email=normalized_email,
+                address=normalized_address,
+                is_whatsapp=is_whatsapp,
+                created_on=now,
+                total_billing=Decimal("0.00"),
+                received_amount=Decimal("0.00"),
+                balance_amount=Decimal("0.00"),
+            )
+
+            paid_total = Decimal("0.00")
+            for index, order_input in enumerate(orders):
+                order = self._build_order_from_input(
+                    customer_id=customer_id,
+                    order_input=order_input,
+                    created_on=now + timedelta(microseconds=index),
+                )
+                customer.orders.append(order)
+                paid_total += order_input.paid_amount
+
+            customer.received_amount = paid_total.quantize(Decimal("0.01"))
+            self._recalculate_customer_billing(customer)
+            session.add(customer)
+            session.commit()
+            return customer_id
+
     def update_customer(
         self,
         *,
@@ -404,6 +672,114 @@ class OperationsService:
         balance = customer.total_billing - Decimal(customer.received_amount)
         customer.balance_amount = balance.quantize(Decimal("0.01"))
 
+    def _build_order_from_input(
+        self,
+        *,
+        customer_id: str,
+        order_input: CustomerOrderCreateInput,
+        created_on: datetime,
+    ) -> OrderModel:
+        normalized_status = order_input.status.strip().upper()
+        if normalized_status not in self.ORDER_STATUSES:
+            raise ValueError(f"Unsupported order status: {order_input.status}")
+        normalized_priority = order_input.priority.strip().title() or "Medium"
+        if normalized_priority not in {"High", "Medium", "Low"}:
+            raise ValueError("Priority must be High, Medium, or Low.")
+        if order_input.paid_amount < Decimal("0.00"):
+            raise ValueError("Paid amount cannot be negative.")
+        if not order_input.items:
+            raise ValueError("Add at least one order item before saving.")
+
+        order_total = Decimal("0.00")
+        quantity = 0
+        order_id = f"ORD-{created_on.strftime('%Y%m%d%H%M%S')}-{created_on.microsecond:06d}"
+        order = OrderModel(
+            order_id=order_id,
+            customer_id=customer_id,
+            title=order_input.title.strip() or "Customer order",
+            quantity=0,
+            order_total=Decimal("0.00"),
+            status=normalized_status,
+            notes="",
+            due_on=self._ensure_optional_utc(order_input.due_on),
+            priority=normalized_priority,
+            created_by=order_input.created_by.strip(),
+            created_on=created_on,
+            updated_on=created_on,
+        )
+        for item_input in order_input.items:
+            if item_input.quantity <= 0:
+                raise ValueError("Quantity must be greater than zero.")
+            if item_input.rate < Decimal("0.00"):
+                raise ValueError("Item rate cannot be negative.")
+            line_amount = item_input.line_amount
+            order_total += line_amount
+            quantity += item_input.quantity
+            order.items.append(
+                OrderItemModel(
+                    order_id=order_id,
+                    item_id=item_input.item_id.strip(),
+                    item_name=item_input.item_name.strip(),
+                    quantity=item_input.quantity,
+                    measurements=item_input.measurements.strip(),
+                    rate=item_input.rate.quantize(Decimal("0.01")),
+                    line_amount=line_amount,
+                    status=(item_input.status.strip().upper() or normalized_status),
+                    updated_on=self._ensure_utc(item_input.updated_on),
+                    updated_by=item_input.updated_by.strip(),
+                )
+            )
+
+        order.quantity = quantity
+        order.order_total = order_total.quantize(Decimal("0.01"))
+        return order
+
+    def _ensure_schema_columns(self) -> None:
+        inspector = inspect(self._engine)
+        table_names = set(inspector.get_table_names())
+        statements_by_table = {
+            "ops_customers": {
+                "store_id": "ALTER TABLE ops_customers ADD COLUMN store_id VARCHAR(50)",
+                "is_whatsapp": "ALTER TABLE ops_customers ADD COLUMN is_whatsapp BOOLEAN NOT NULL DEFAULT 0",
+            },
+            "ops_orders": {
+                "due_on": "ALTER TABLE ops_orders ADD COLUMN due_on DATETIME",
+                "priority": "ALTER TABLE ops_orders ADD COLUMN priority VARCHAR(40) NOT NULL DEFAULT 'Medium'",
+                "created_by": "ALTER TABLE ops_orders ADD COLUMN created_by VARCHAR(150) NOT NULL DEFAULT ''",
+            },
+            "ops_order_items": {
+                "measurements": "ALTER TABLE ops_order_items ADD COLUMN measurements VARCHAR(240) NOT NULL DEFAULT ''",
+            },
+        }
+
+        missing_statements: list[str] = []
+        for table_name, column_statements in statements_by_table.items():
+            if table_name not in table_names:
+                continue
+            existing_columns = {
+                column["name"]
+                for column in inspector.get_columns(table_name)
+            }
+            missing_statements.extend(
+                statement
+                for column_name, statement in column_statements.items()
+                if column_name not in existing_columns
+            )
+
+        if not missing_statements:
+            return
+
+        with self._engine.begin() as connection:
+            for statement in missing_statements:
+                connection.exec_driver_sql(statement)
+
+    def _customer_search_filter(self, normalized_query: str):
+        return (
+            (func.lower(CustomerModel.full_name).contains(normalized_query))
+            | (func.lower(CustomerModel.mobile).contains(normalized_query))
+            | (func.lower(CustomerModel.email).contains(normalized_query))
+        )
+
     def _seed_if_needed(self) -> None:
         with self._session_factory() as session:
             customer_count = session.scalar(select(func.count()).select_from(CustomerModel)) or 0
@@ -480,10 +856,12 @@ class OperationsService:
     def _to_customer_row(self, row: CustomerModel) -> CustomerRow:
         return CustomerRow(
             customer_id=row.customer_id,
+            store_id=row.store_id,
             full_name=row.full_name,
             mobile=row.mobile,
             email=row.email,
             address=row.address,
+            is_whatsapp=bool(row.is_whatsapp),
             created_on=self._ensure_utc(row.created_on),
             total_billing=Decimal(row.total_billing).quantize(Decimal("0.01")),
             received_amount=Decimal(row.received_amount).quantize(Decimal("0.01")),
@@ -500,8 +878,25 @@ class OperationsService:
             order_total=Decimal(row.order_total).quantize(Decimal("0.01")),
             status=row.status,
             notes=row.notes,
+            due_on=self._ensure_optional_utc(row.due_on),
+            priority=row.priority,
+            created_by=row.created_by,
             created_on=self._ensure_utc(row.created_on),
             updated_on=self._ensure_utc(row.updated_on),
+        )
+
+    def _to_customer_summary_row(self, row: CustomerModel) -> CustomerSummaryRow:
+        last_order_on = max(
+            (self._ensure_utc(order.created_on) for order in row.orders),
+            default=None,
+        )
+        return CustomerSummaryRow(
+            customer_id=row.customer_id,
+            full_name=row.full_name,
+            mobile=row.mobile,
+            email=row.email,
+            last_order_on=last_order_on,
+            balance_amount=Decimal(row.balance_amount).quantize(Decimal("0.01")),
         )
 
     def _to_item_row(self, row: ItemModel) -> ItemRow:
@@ -518,3 +913,8 @@ class OperationsService:
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
+
+    def _ensure_optional_utc(self, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return self._ensure_utc(value)

@@ -44,6 +44,7 @@ class OrderModel(Base):
     title: Mapped[str] = mapped_column(String(160), nullable=False)
     quantity: Mapped[int] = mapped_column(nullable=False, default=1)
     order_total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    paid_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     status: Mapped[str] = mapped_column(String(40), nullable=False)
     notes: Mapped[str] = mapped_column(String(240), nullable=False, default="")
     due_on: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -54,6 +55,10 @@ class OrderModel(Base):
 
     customer: Mapped[CustomerModel] = relationship(back_populates="orders")
     items: Mapped[list["OrderItemModel"]] = relationship(
+        back_populates="order",
+        cascade="all, delete-orphan",
+    )
+    payments: Mapped[list["PaymentModel"]] = relationship(
         back_populates="order",
         cascade="all, delete-orphan",
     )
@@ -70,6 +75,10 @@ class OrderItemModel(Base):
     item_id: Mapped[str] = mapped_column(String(50), nullable=False)
     item_name: Mapped[str] = mapped_column(String(160), nullable=False)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    measurement_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ops_measurements.measurement_id", ondelete="SET NULL"),
+        nullable=True,
+    )
     measurements: Mapped[str] = mapped_column(String(240), nullable=False, default="")
     rate: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     line_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
@@ -78,6 +87,7 @@ class OrderItemModel(Base):
     updated_by: Mapped[str] = mapped_column(String(150), nullable=False, default="")
 
     order: Mapped[OrderModel] = relationship(back_populates="items")
+    measurement: Mapped["MeasurementModel | None"] = relationship("MeasurementModel")
 
 
 class ItemModel(Base):
@@ -89,6 +99,40 @@ class ItemModel(Base):
     cost: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     created_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class PaymentModel(Base):
+    __tablename__ = "ops_payments"
+
+    payment_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    order_id: Mapped[str] = mapped_column(
+        ForeignKey("ops_orders.order_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    customer_id: Mapped[str] = mapped_column(
+        ForeignKey("ops_customers.customer_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    paid_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    payment_method: Mapped[str] = mapped_column(String(80), nullable=False, default="")
+    notes: Mapped[str] = mapped_column(String(240), nullable=False, default="")
+    payment_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    order: Mapped[OrderModel] = relationship(back_populates="payments")
+
+
+class MeasurementModel(Base):
+    __tablename__ = "ops_measurements"
+
+    measurement_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    customer_id: Mapped[str] = mapped_column(
+        ForeignKey("ops_customers.customer_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    item_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    item_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    measurements: Mapped[str] = mapped_column(String(240), nullable=False)
+    measurement_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 @dataclass(frozen=True)
@@ -114,6 +158,7 @@ class OrderRow:
     title: str
     quantity: int
     order_total: Decimal
+    paid_amount: Decimal
     status: str
     notes: str
     due_on: datetime | None
@@ -121,6 +166,22 @@ class OrderRow:
     created_by: str
     created_on: datetime
     updated_on: datetime
+
+
+@dataclass(frozen=True)
+class OrderItemRow:
+    order_item_id: int
+    order_id: str
+    item_id: str
+    item_name: str
+    quantity: int
+    measurement_id: int | None
+    measurements: str
+    rate: Decimal
+    line_amount: Decimal
+    status: str
+    updated_on: datetime
+    updated_by: str
 
 
 @dataclass(frozen=True)
@@ -134,6 +195,16 @@ class ItemRow:
 
 
 @dataclass(frozen=True)
+class MeasurementRow:
+    measurement_id: int
+    customer_id: str
+    item_id: str
+    item_name: str
+    measurements: str
+    measurement_date: datetime
+
+
+@dataclass(frozen=True)
 class OrderItemCreateInput:
     item_id: str
     item_name: str
@@ -143,6 +214,7 @@ class OrderItemCreateInput:
     status: str
     updated_on: datetime
     updated_by: str
+    measurement_id: int | None = None
 
     @property
     def line_amount(self) -> Decimal:
@@ -178,6 +250,35 @@ class OrderQueueRow:
     priority: str
     item_name: str
     status: str
+
+
+@dataclass(frozen=True)
+class CustomerOrderHistoryRow:
+    order_id: str
+    title: str
+    order_date: datetime
+    due_date: datetime | None
+    priority: str
+    order_status: str
+    created_by: str
+    order_total: Decimal
+    paid_amount: Decimal
+    item_name: str
+    quantity: int
+    measurements: str
+    item_status: str
+    line_amount: Decimal
+    updated_on: datetime
+    updated_by: str
+
+
+@dataclass(frozen=True)
+class PaymentHistoryRow:
+    order_id: str
+    payment_date: datetime
+    paid_amount: Decimal
+    payment_method: str
+    notes: str
 
 
 class OperationsService:
@@ -447,12 +548,145 @@ class OperationsService:
                 return None
             return self._to_customer_row(row)
 
+    def get_customer_for_store(self, *, store_id: str, customer_id: str) -> CustomerRow | None:
+        normalized_store_id = store_id.strip()
+        normalized_customer_id = customer_id.strip()
+        if not normalized_store_id or not normalized_customer_id:
+            return None
+        with self._session_factory() as session:
+            row = session.scalar(
+                select(CustomerModel).where(
+                    CustomerModel.store_id == normalized_store_id,
+                    CustomerModel.customer_id == normalized_customer_id,
+                )
+            )
+            if row is None:
+                return None
+            return self._to_customer_row(row)
+
     def get_order(self, order_id: str) -> OrderRow | None:
         with self._session_factory() as session:
             row = session.get(OrderModel, order_id)
             if row is None:
                 return None
             return self._to_order_row(row)
+
+    def list_orders_for_customer(self, *, store_id: str, customer_id: str) -> tuple[OrderRow, ...]:
+        normalized_store_id = store_id.strip()
+        normalized_customer_id = customer_id.strip()
+        if not normalized_store_id or not normalized_customer_id:
+            return ()
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(OrderModel)
+                .join(CustomerModel, CustomerModel.customer_id == OrderModel.customer_id)
+                .where(
+                    CustomerModel.store_id == normalized_store_id,
+                    OrderModel.customer_id == normalized_customer_id,
+                )
+                .order_by(OrderModel.created_on.desc())
+            ).all()
+            return tuple(self._to_order_row(row) for row in rows)
+
+    def list_order_items_for_order(self, *, order_id: str) -> tuple[OrderItemRow, ...]:
+        normalized_order_id = order_id.strip()
+        if not normalized_order_id:
+            return ()
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(OrderItemModel)
+                .where(OrderItemModel.order_id == normalized_order_id)
+                .order_by(OrderItemModel.order_item_id.asc())
+            ).all()
+            return tuple(self._to_order_item_row(row) for row in rows)
+
+    def list_measurements_for_customer(self, *, customer_id: str) -> tuple[MeasurementRow, ...]:
+        normalized_customer_id = customer_id.strip()
+        if not normalized_customer_id:
+            return ()
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(MeasurementModel)
+                .where(MeasurementModel.customer_id == normalized_customer_id)
+                .order_by(MeasurementModel.measurement_date.desc(), MeasurementModel.measurement_id.desc())
+            ).all()
+            return tuple(self._to_measurement_row(row) for row in rows)
+
+    def list_customer_order_history_for_store(
+        self,
+        *,
+        store_id: str,
+        customer_id: str,
+    ) -> tuple[CustomerOrderHistoryRow, ...]:
+        normalized_store_id = store_id.strip()
+        normalized_customer_id = customer_id.strip()
+        if not normalized_store_id or not normalized_customer_id:
+            return ()
+
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(OrderModel, OrderItemModel)
+                .join(CustomerModel, CustomerModel.customer_id == OrderModel.customer_id)
+                .join(OrderItemModel, OrderItemModel.order_id == OrderModel.order_id)
+                .where(
+                    CustomerModel.store_id == normalized_store_id,
+                    OrderModel.customer_id == normalized_customer_id,
+                )
+                .order_by(OrderModel.created_on.desc(), OrderItemModel.order_item_id.asc())
+            ).all()
+            return tuple(
+                CustomerOrderHistoryRow(
+                    order_id=order.order_id,
+                    title=order.title,
+                    order_date=self._ensure_utc(order.created_on),
+                    due_date=self._ensure_optional_utc(order.due_on),
+                    priority=order.priority,
+                    order_status=order.status,
+                    created_by=order.created_by,
+                    order_total=Decimal(order.order_total).quantize(Decimal("0.01")),
+                    paid_amount=Decimal(order.paid_amount).quantize(Decimal("0.01")),
+                    item_name=item.item_name,
+                    quantity=item.quantity,
+                    measurements=self._measurement_text_for_item(item),
+                    item_status=item.status,
+                    line_amount=Decimal(item.line_amount).quantize(Decimal("0.01")),
+                    updated_on=self._ensure_utc(item.updated_on),
+                    updated_by=item.updated_by,
+                )
+                for order, item in rows
+            )
+
+    def list_payment_history_for_store(
+        self,
+        *,
+        store_id: str,
+        customer_id: str,
+    ) -> tuple[PaymentHistoryRow, ...]:
+        normalized_store_id = store_id.strip()
+        normalized_customer_id = customer_id.strip()
+        if not normalized_store_id or not normalized_customer_id:
+            return ()
+
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(PaymentModel)
+                .join(CustomerModel, CustomerModel.customer_id == PaymentModel.customer_id)
+                .where(
+                    CustomerModel.store_id == normalized_store_id,
+                    PaymentModel.customer_id == normalized_customer_id,
+                )
+                .order_by(PaymentModel.payment_date.desc(), PaymentModel.payment_id.desc())
+            ).scalars().all()
+            return tuple(
+                PaymentHistoryRow(
+                    order_id=row.order_id,
+                    payment_date=self._ensure_utc(row.payment_date),
+                    paid_amount=Decimal(row.paid_amount).quantize(Decimal("0.01")),
+                    payment_method=row.payment_method,
+                    notes=row.notes,
+                )
+                for row in rows
+            )
 
     def create_customer(
         self,
@@ -539,6 +773,7 @@ class OperationsService:
                     customer_id=customer_id,
                     order_input=order_input,
                     created_on=now + timedelta(microseconds=index),
+                    session=session,
                 )
                 customer.orders.append(order)
                 paid_total += order_input.paid_amount
@@ -568,6 +803,42 @@ class OperationsService:
             customer.email = email.strip()
             customer.address = address.strip()
             session.commit()
+
+    def create_order_for_customer(
+        self,
+        *,
+        store_id: str,
+        customer_id: str,
+        order: CustomerOrderCreateInput,
+    ) -> str:
+        normalized_store_id = store_id.strip()
+        normalized_customer_id = customer_id.strip()
+        if not normalized_store_id or not normalized_customer_id:
+            raise ValueError("Store and customer are required before creating an order.")
+
+        now = datetime.now(tz=timezone.utc)
+        with self._session_factory() as session:
+            customer = session.scalar(
+                select(CustomerModel).where(
+                    CustomerModel.store_id == normalized_store_id,
+                    CustomerModel.customer_id == normalized_customer_id,
+                )
+            )
+            if customer is None:
+                raise ValueError("The selected customer could not be found for this store.")
+            created_order = self._build_order_from_input(
+                customer_id=normalized_customer_id,
+                order_input=order,
+                created_on=now,
+                session=session,
+            )
+            customer.orders.append(created_order)
+            customer.received_amount = (
+                Decimal(customer.received_amount) + order.paid_amount
+            ).quantize(Decimal("0.01"))
+            self._recalculate_customer_billing(customer)
+            session.commit()
+            return created_order.order_id
 
     def create_order(
         self,
@@ -599,6 +870,7 @@ class OperationsService:
                 title=title.strip(),
                 quantity=quantity,
                 order_total=order_total.quantize(Decimal("0.01")),
+                paid_amount=Decimal("0.00"),
                 status=status,
                 notes=notes.strip(),
                 created_on=now,
@@ -663,6 +935,94 @@ class OperationsService:
                         order.updated_on = datetime.now(tz=timezone.utc)
             session.commit()
 
+    def add_payment_for_order(
+        self,
+        *,
+        store_id: str,
+        customer_id: str,
+        order_id: str,
+        paid_amount: Decimal,
+        payment_method: str,
+        notes: str,
+    ) -> None:
+        normalized_store_id = store_id.strip()
+        normalized_customer_id = customer_id.strip()
+        normalized_order_id = order_id.strip()
+        if not normalized_store_id or not normalized_customer_id or not normalized_order_id:
+            raise ValueError("Store, customer, and order are required before recording payment.")
+        if paid_amount <= Decimal("0.00"):
+            raise ValueError("Payment amount must be greater than zero.")
+
+        with self._session_factory() as session:
+            order = session.scalar(
+                select(OrderModel)
+                .join(CustomerModel, CustomerModel.customer_id == OrderModel.customer_id)
+                .where(
+                    CustomerModel.store_id == normalized_store_id,
+                    OrderModel.customer_id == normalized_customer_id,
+                    OrderModel.order_id == normalized_order_id,
+                )
+            )
+            if order is None:
+                raise ValueError("The selected order could not be found for this customer.")
+
+            payment_amount = paid_amount.quantize(Decimal("0.01"))
+            current_paid = Decimal(order.paid_amount).quantize(Decimal("0.01"))
+            order_total = Decimal(order.order_total).quantize(Decimal("0.01"))
+            if current_paid + payment_amount > order_total:
+                raise ValueError("Payment amount cannot be greater than the selected order balance.")
+
+            now = datetime.now(tz=timezone.utc)
+            order.paid_amount = (current_paid + payment_amount).quantize(Decimal("0.01"))
+            order.updated_on = now
+            order.payments.append(
+                PaymentModel(
+                    order_id=normalized_order_id,
+                    customer_id=normalized_customer_id,
+                    paid_amount=payment_amount,
+                    payment_method=payment_method.strip(),
+                    notes=notes.strip(),
+                    payment_date=now,
+                )
+            )
+            customer = order.customer
+            customer.received_amount = (
+                Decimal(customer.received_amount) + payment_amount
+            ).quantize(Decimal("0.01"))
+            self._recalculate_customer_billing(customer)
+            session.commit()
+
+    def update_measurement_for_store(
+        self,
+        *,
+        store_id: str,
+        customer_id: str,
+        measurement_id: int,
+        measurements: str,
+    ) -> None:
+        normalized_store_id = store_id.strip()
+        normalized_customer_id = customer_id.strip()
+        if not normalized_store_id or not normalized_customer_id:
+            raise ValueError("Store and customer are required before updating measurements.")
+        if measurement_id <= 0:
+            raise ValueError("Measurement selection is required.")
+
+        with self._session_factory() as session:
+            measurement = session.scalar(
+                select(MeasurementModel)
+                .join(CustomerModel, CustomerModel.customer_id == MeasurementModel.customer_id)
+                .where(
+                    CustomerModel.store_id == normalized_store_id,
+                    MeasurementModel.customer_id == normalized_customer_id,
+                    MeasurementModel.measurement_id == measurement_id,
+                )
+            )
+            if measurement is None:
+                raise ValueError("The selected measurement could not be found for this customer.")
+            measurement.measurements = measurements.strip()
+            measurement.measurement_date = datetime.now(tz=timezone.utc)
+            session.commit()
+
     def _recalculate_customer_billing(self, customer: CustomerModel) -> None:
         total_billing = Decimal("0.00")
         for order in customer.orders:
@@ -678,6 +1038,7 @@ class OperationsService:
         customer_id: str,
         order_input: CustomerOrderCreateInput,
         created_on: datetime,
+        session: Session | None = None,
     ) -> OrderModel:
         normalized_status = order_input.status.strip().upper()
         if normalized_status not in self.ORDER_STATUSES:
@@ -699,6 +1060,7 @@ class OperationsService:
             title=order_input.title.strip() or "Customer order",
             quantity=0,
             order_total=Decimal("0.00"),
+            paid_amount=order_input.paid_amount.quantize(Decimal("0.01")),
             status=normalized_status,
             notes="",
             due_on=self._ensure_optional_utc(order_input.due_on),
@@ -715,13 +1077,29 @@ class OperationsService:
             line_amount = item_input.line_amount
             order_total += line_amount
             quantity += item_input.quantity
+            measurement_text = item_input.measurements.strip()
+            measurement = None
+            if item_input.measurement_id is not None and session is not None:
+                measurement = session.get(MeasurementModel, item_input.measurement_id)
+                if measurement is None or measurement.customer_id != customer_id:
+                    raise ValueError("The selected measurement could not be found for this customer.")
+                measurement_text = measurement.measurements
+            elif measurement_text:
+                measurement = MeasurementModel(
+                    customer_id=customer_id,
+                    item_id=item_input.item_id.strip(),
+                    item_name=item_input.item_name.strip(),
+                    measurements=measurement_text,
+                    measurement_date=self._ensure_utc(item_input.updated_on),
+                )
             order.items.append(
                 OrderItemModel(
                     order_id=order_id,
                     item_id=item_input.item_id.strip(),
                     item_name=item_input.item_name.strip(),
                     quantity=item_input.quantity,
-                    measurements=item_input.measurements.strip(),
+                    measurement=measurement,
+                    measurements=measurement_text,
                     rate=item_input.rate.quantize(Decimal("0.01")),
                     line_amount=line_amount,
                     status=(item_input.status.strip().upper() or normalized_status),
@@ -732,12 +1110,29 @@ class OperationsService:
 
         order.quantity = quantity
         order.order_total = order_total.quantize(Decimal("0.01"))
+        if order.paid_amount > order.order_total:
+            raise ValueError("Paid amount cannot be greater than order total.")
+        if order.paid_amount > Decimal("0.00"):
+            order.payments.append(
+                PaymentModel(
+                    order_id=order_id,
+                    customer_id=customer_id,
+                    paid_amount=order.paid_amount,
+                    payment_method="",
+                    notes="",
+                    payment_date=created_on,
+                )
+            )
         return order
 
     def _ensure_schema_columns(self) -> None:
         inspector = inspect(self._engine)
         table_names = set(inspector.get_table_names())
         statements_by_table = {
+            "ops_payments": {
+                "payment_method": "ALTER TABLE ops_payments ADD COLUMN payment_method VARCHAR(80) NOT NULL DEFAULT ''",
+                "notes": "ALTER TABLE ops_payments ADD COLUMN notes VARCHAR(240) NOT NULL DEFAULT ''",
+            },
             "ops_customers": {
                 "store_id": "ALTER TABLE ops_customers ADD COLUMN store_id VARCHAR(50)",
                 "is_whatsapp": "ALTER TABLE ops_customers ADD COLUMN is_whatsapp BOOLEAN NOT NULL DEFAULT 0",
@@ -746,8 +1141,10 @@ class OperationsService:
                 "due_on": "ALTER TABLE ops_orders ADD COLUMN due_on DATETIME",
                 "priority": "ALTER TABLE ops_orders ADD COLUMN priority VARCHAR(40) NOT NULL DEFAULT 'Medium'",
                 "created_by": "ALTER TABLE ops_orders ADD COLUMN created_by VARCHAR(150) NOT NULL DEFAULT ''",
+                "paid_amount": "ALTER TABLE ops_orders ADD COLUMN paid_amount NUMERIC(12, 2) NOT NULL DEFAULT 0",
             },
             "ops_order_items": {
+                "measurement_id": "ALTER TABLE ops_order_items ADD COLUMN measurement_id INTEGER",
                 "measurements": "ALTER TABLE ops_order_items ADD COLUMN measurements VARCHAR(240) NOT NULL DEFAULT ''",
             },
         }
@@ -876,6 +1273,7 @@ class OperationsService:
             title=row.title,
             quantity=row.quantity,
             order_total=Decimal(row.order_total).quantize(Decimal("0.01")),
+            paid_amount=Decimal(row.paid_amount).quantize(Decimal("0.01")),
             status=row.status,
             notes=row.notes,
             due_on=self._ensure_optional_utc(row.due_on),
@@ -884,6 +1282,37 @@ class OperationsService:
             created_on=self._ensure_utc(row.created_on),
             updated_on=self._ensure_utc(row.updated_on),
         )
+
+    def _to_order_item_row(self, row: OrderItemModel) -> OrderItemRow:
+        return OrderItemRow(
+            order_item_id=row.order_item_id,
+            order_id=row.order_id,
+            item_id=row.item_id,
+            item_name=row.item_name,
+            quantity=row.quantity,
+            measurement_id=row.measurement_id,
+            measurements=self._measurement_text_for_item(row),
+            rate=Decimal(row.rate).quantize(Decimal("0.01")),
+            line_amount=Decimal(row.line_amount).quantize(Decimal("0.01")),
+            status=row.status,
+            updated_on=self._ensure_utc(row.updated_on),
+            updated_by=row.updated_by,
+        )
+
+    def _to_measurement_row(self, row: MeasurementModel) -> MeasurementRow:
+        return MeasurementRow(
+            measurement_id=row.measurement_id,
+            customer_id=row.customer_id,
+            item_id=row.item_id,
+            item_name=row.item_name,
+            measurements=row.measurements,
+            measurement_date=self._ensure_utc(row.measurement_date),
+        )
+
+    def _measurement_text_for_item(self, item: OrderItemModel) -> str:
+        if item.measurement is not None and item.measurement.measurements:
+            return item.measurement.measurements
+        return item.measurements
 
     def _to_customer_summary_row(self, row: CustomerModel) -> CustomerSummaryRow:
         last_order_on = max(

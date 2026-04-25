@@ -360,11 +360,12 @@ class CustomerOrderEntryDialog(QDialog):
         summary_row.setSpacing(14)
         self.bill_amount_input = self._summary_value("0.00")
         self.paid_amount_input = QLineEdit("0.00")
-        self.paid_amount_input.setObjectName("SummaryAmountInput")
+        self.paid_amount_input.setObjectName("AmountPaidInput")
+        self.paid_amount_input.setPlaceholderText("Enter amount")
         self.balance_amount_input = self._summary_value("0.00")
         self._dialog_control(self.paid_amount_input)
         summary_row.addWidget(self._summary_block("Bill Amount (INR)", self.bill_amount_input))
-        summary_row.addWidget(self._summary_block("Paid Amount (INR)", self.paid_amount_input))
+        summary_row.addWidget(self._summary_block("Amount Paid (INR)", self.paid_amount_input))
         summary_row.addWidget(self._summary_block("Balance (INR)", self.balance_amount_input))
         items_header.addLayout(summary_row)
 
@@ -391,6 +392,7 @@ class CustomerOrderEntryDialog(QDialog):
         self._refresh_item_defaults()
         self._refresh_measurement_options()
         self._refresh_items_table()
+        self._update_bill_amount()
 
     def payload(self) -> dict[str, object]:
         due_date = self.due_date_input.date().toPython()
@@ -522,7 +524,11 @@ class CustomerOrderEntryDialog(QDialog):
         self.measurements_input.clear()
         self.measurements_input.addItem("Select measurement", None)
         for row in self._measurement_rows:
-            if row.item_id == selected_item_id:
+            if (
+                row.item_id == selected_item_id
+                and row.measurement_id is not None
+                and row.measurements.strip()
+            ):
                 self.measurements_input.addItem(row.measurements, row.measurement_id)
         self.measurements_input.blockSignals(False)
 
@@ -581,6 +587,17 @@ class CustomerOrderEntryDialog(QDialog):
     def _update_bill_amount(self) -> None:
         bill_amount = self._bill_amount()
         self.bill_amount_input.setText(f"{bill_amount:,.2f}")
+        if bill_amount <= Decimal("0.00"):
+            if self.paid_amount_input.isEnabled():
+                self.paid_amount_input.setEnabled(False)
+            if self.paid_amount_input.text() != "0.00":
+                self.paid_amount_input.blockSignals(True)
+                self.paid_amount_input.setText("0.00")
+                self.paid_amount_input.blockSignals(False)
+            self.balance_amount_input.setText("0.00")
+            return
+        if not self.paid_amount_input.isEnabled():
+            self.paid_amount_input.setEnabled(True)
         try:
             paid_amount = self._parse_paid_amount(self.paid_amount_input.text())
         except ValueError:
@@ -645,7 +662,7 @@ class CustomerOrderEntryDialog(QDialog):
     def _summary_value(self, value: str) -> QLineEdit:
         widget = QLineEdit(value)
         widget.setReadOnly(True)
-        widget.setObjectName("SummaryAmountInput")
+        widget.setObjectName("SummaryReadonlyAmount")
         return widget
 
     def _summary_block(self, title: str, value_widget: QWidget) -> QWidget:
@@ -816,7 +833,7 @@ class CustomerOrderEntryDialog(QDialog):
                 font-size: 12px;
                 font-weight: 700;
             }
-            QLineEdit#SummaryAmountInput {
+            QLineEdit#SummaryReadonlyAmount {
                 min-width: 92px;
                 min-height: 20px;
                 border: none;
@@ -826,8 +843,26 @@ class CustomerOrderEntryDialog(QDialog):
                 font-weight: 300;
                 padding: 0;
             }
-            QLineEdit#SummaryAmountInput:focus {
+            QLineEdit#SummaryReadonlyAmount:focus {
                 border: none;
+            }
+            QLineEdit#AmountPaidInput {
+                min-width: 118px;
+                min-height: 34px;
+                border: 1px solid #dfe3ec;
+                border-radius: 7px;
+                background-color: #ffffff;
+                color: #111827;
+                font-size: 9pt;
+                font-weight: 500;
+                padding: 0 10px;
+            }
+            QLineEdit#AmountPaidInput:focus {
+                border: 1px solid #4f46e5;
+            }
+            QLineEdit#AmountPaidInput:disabled {
+                background-color: #f8fafc;
+                color: #98a2b3;
             }
             QLabel#StatusMessage {
                 padding: 10px 12px;
@@ -858,12 +893,14 @@ class CustomerDetailsDialog(QDialog):
         "Paid Amount",
         "Amount",
         "Balance Amount",
+        "Bill Status",
         "Status",
     )
     PAYMENT_HEADERS = (
         "Order ID",
         "Payment Date",
         "Paid Amount",
+        "Notes",
     )
     MEASUREMENT_HEADERS = (
         "Item",
@@ -1019,6 +1056,7 @@ class CustomerDetailsDialog(QDialog):
         self.orders_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         self.orders_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         self.orders_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        self.orders_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
         _apply_compact_table_style(self.orders_table, row_height=24)
         self.orders_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._set_order_summary_rows()
@@ -1099,6 +1137,7 @@ class CustomerDetailsDialog(QDialog):
         self.new_order_button.clicked.connect(self._open_new_order_dialog)
         self.orders_table.cellClicked.connect(self._handle_order_row_clicked)
         self.mark_payment_button.clicked.connect(self._mark_payment)
+        self.delivered_button.clicked.connect(self._mark_delivered)
         self.save_measurements_button.clicked.connect(self._save_measurements)
         self._refresh_latest_order_summary()
 
@@ -1147,6 +1186,7 @@ class CustomerDetailsDialog(QDialog):
                     "paid_amount": row.paid_amount,
                     "amount": row.order_total,
                     "balance_amount": max(Decimal("0.00"), row.order_total - row.paid_amount),
+                    "bill_status": row.bill_status,
                     "status": row.order_status,
                 },
             )
@@ -1185,6 +1225,7 @@ class CustomerDetailsDialog(QDialog):
                 self._format_currency(row["paid_amount"]),  # type: ignore[arg-type]
                 self._format_currency(row["amount"]),  # type: ignore[arg-type]
                 self._format_currency(row["balance_amount"]),  # type: ignore[arg-type]
+                str(row["bill_status"]),
                 str(row["status"]),
             )
             for column_index, value in enumerate(values):
@@ -1221,6 +1262,7 @@ class CustomerDetailsDialog(QDialog):
                 row.order_id,
                 self._format_date(row.payment_date),
                 self._format_currency(row.paid_amount),
+                row.notes,
             )
             for column_index, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -1285,6 +1327,7 @@ class CustomerDetailsDialog(QDialog):
         layout.addWidget(title)
         self.current_order_id = self._summary_line(layout, "Order ID")
         self.current_total_items = self._summary_line(layout, "Total Items")
+        self.current_bill_status = self._summary_line(layout, "Bill Status")
         self.current_order_status = self._summary_line(layout, "Status")
         self.current_delivery_date = self._summary_line(layout, "Delivery Date")
         return card
@@ -1345,10 +1388,24 @@ class CustomerDetailsDialog(QDialog):
         self.mark_payment_button.setObjectName("DetailPrimaryButton")
         self.print_receipt_button = QPushButton("Print Receipt")
         self.print_receipt_button.setObjectName("DetailOutlineButton")
+        self.delivered_button = QPushButton("Delivered")
+        self.delivered_button.setObjectName("DetailPrimaryButton")
+        self.delivered_button.hide()
         self.payment_feedback = QLabel("")
         self.payment_feedback.setObjectName("DetailFeedback")
         self.payment_feedback.setWordWrap(True)
         self.payment_feedback.hide()
+
+        self._payment_form_widgets = (
+            amount_label,
+            self.payment_amount_input,
+            method_label,
+            self.payment_method_combo,
+            notes_label,
+            self.payment_notes_input,
+            self.mark_payment_button,
+            self.print_receipt_button,
+        )
 
         layout.addWidget(amount_label)
         layout.addWidget(self.payment_amount_input)
@@ -1358,6 +1415,7 @@ class CustomerDetailsDialog(QDialog):
         layout.addWidget(self.payment_notes_input)
         layout.addWidget(self.mark_payment_button)
         layout.addWidget(self.print_receipt_button)
+        layout.addWidget(self.delivered_button)
         layout.addWidget(self.payment_feedback)
         return card
 
@@ -1365,8 +1423,16 @@ class CustomerDetailsDialog(QDialog):
         if not self._selected_order_id:
             self._set_payment_feedback("Select an order before marking payment.", tone="error")
             return
+        raw_amount = self.payment_amount_input.text().replace(",", "").strip()
+        notes = self.payment_notes_input.toPlainText()
+        normalized_notes = notes.strip()
         try:
-            amount = Decimal(self.payment_amount_input.text().replace(",", "").strip()).quantize(Decimal("0.01"))
+            amount = (
+                Decimal("0.00")
+                if not raw_amount
+                and normalized_notes
+                else Decimal(raw_amount).quantize(Decimal("0.01"))
+            )
         except Exception:
             self._set_payment_feedback("Enter a valid payment amount.", tone="error")
             return
@@ -1377,7 +1443,7 @@ class CustomerDetailsDialog(QDialog):
                 order_id=self._selected_order_id,
                 paid_amount=amount,
                 payment_method=self.payment_method_combo.currentText(),
-                notes=self.payment_notes_input.toPlainText(),
+                notes=notes,
             )
         except ValueError as exc:
             self._set_payment_feedback(str(exc), tone="error")
@@ -1385,6 +1451,22 @@ class CustomerDetailsDialog(QDialog):
         self.payment_amount_input.clear()
         self.payment_notes_input.clear()
         self._set_payment_feedback("Payment recorded.", tone="success")
+        self._reload_customer_detail_data()
+
+    def _mark_delivered(self) -> None:
+        if not self._selected_order_id:
+            self._set_payment_feedback("Select an order before marking delivery.", tone="error")
+            return
+        try:
+            self._operations_service.mark_order_delivered_for_store(
+                store_id=self._store_id,
+                customer_id=self._customer.customer_id,
+                order_id=self._selected_order_id,
+            )
+        except ValueError as exc:
+            self._set_payment_feedback(str(exc), tone="error")
+            return
+        self._set_payment_feedback("Order marked delivered.", tone="success")
         self._reload_customer_detail_data()
 
     def _open_new_order_dialog(self) -> None:
@@ -1440,11 +1522,13 @@ class CustomerDetailsDialog(QDialog):
                 item = self.measurements_table.item(row_index, 1)
                 if item is None:
                     continue
-                self._operations_service.update_measurement_for_store(
+                self._operations_service.save_measurement_for_store(
                     store_id=self._store_id,
                     customer_id=self._customer.customer_id,
-                    measurement_id=measurement.measurement_id,
+                    item_id=measurement.item_id,
+                    item_name=measurement.item_name,
                     measurements=item.text(),
+                    measurement_id=measurement.measurement_id,
                 )
         except ValueError as exc:
             self._set_payment_feedback(str(exc), tone="error")
@@ -1470,6 +1554,7 @@ class CustomerDetailsDialog(QDialog):
         )
         self._measurement_rows = self._operations_service.list_measurements_for_customer(
             customer_id=self._customer.customer_id,
+            store_id=self._store_id,
         )
         previous_order_id = self._selected_order_id
         self._order_summaries = self._build_order_summaries()
@@ -1521,6 +1606,7 @@ class CustomerDetailsDialog(QDialog):
             percent = int(min(100, (paid_amount / amount) * Decimal("100")))
         self.current_order_id.setText(str(summary["order_id"]))
         self.current_total_items.setText(str(summary["total_items"]))
+        self.current_bill_status.setText(str(summary["bill_status"]))
         self.current_order_status.setText(str(summary["status"]))
         self.current_delivery_date.setText(self._format_date(summary["due_date"]))  # type: ignore[arg-type]
         self.payment_total_amount.setText(self._format_currency(amount))  # type: ignore[arg-type]
@@ -1528,6 +1614,15 @@ class CustomerDetailsDialog(QDialog):
         self.payment_balance_amount.setText(self._format_currency(balance_amount))  # type: ignore[arg-type]
         self.payment_percent.setText(f"{percent}% Paid")
         self.payment_progress_fill.setFixedWidth(max(0, int(self.payment_progress.width() * percent / 100)))
+        self._refresh_payment_action_card(summary)
+
+    def _refresh_payment_action_card(self, summary: dict[str, object]) -> None:
+        balance_amount = summary["balance_amount"]
+        is_paid = isinstance(balance_amount, Decimal) and balance_amount <= Decimal("0.00")
+        for widget in self._payment_form_widgets:
+            widget.setVisible(not is_paid)
+        self.delivered_button.setVisible(is_paid)
+        self.delivered_button.setEnabled(str(summary["status"]) != "DELIVERED")
 
     def _format_date(self, value: datetime | None) -> str:
         if value is None:
@@ -2301,6 +2396,7 @@ class StoreManagerCustomerDashboardScreen(QWidget):
         )
         measurement_rows = self._operations_service.list_measurements_for_customer(
             customer_id=selected_customer.customer_id,
+            store_id=self._store_context.store_id,
         )
         CustomerDetailsDialog(
             customer=customer,

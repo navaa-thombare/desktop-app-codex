@@ -45,6 +45,7 @@ class OrderModel(Base):
     quantity: Mapped[int] = mapped_column(nullable=False, default=1)
     order_total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     paid_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    bill_status: Mapped[str] = mapped_column(String(40), nullable=False, default="UNPAID")
     status: Mapped[str] = mapped_column(String(40), nullable=False)
     notes: Mapped[str] = mapped_column(String(240), nullable=False, default="")
     due_on: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -83,6 +84,9 @@ class OrderItemModel(Base):
     rate: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     line_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     status: Mapped[str] = mapped_column(String(40), nullable=False, default="NEW")
+    assigned_worker_id: Mapped[str] = mapped_column(String(50), nullable=False, default="")
+    assigned_worker_name: Mapped[str] = mapped_column(String(150), nullable=False, default="")
+    assigned_on: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_by: Mapped[str] = mapped_column(String(150), nullable=False, default="")
 
@@ -159,6 +163,7 @@ class OrderRow:
     quantity: int
     order_total: Decimal
     paid_amount: Decimal
+    bill_status: str
     status: str
     notes: str
     due_on: datetime | None
@@ -196,12 +201,12 @@ class ItemRow:
 
 @dataclass(frozen=True)
 class MeasurementRow:
-    measurement_id: int
+    measurement_id: int | None
     customer_id: str
     item_id: str
     item_name: str
     measurements: str
-    measurement_date: datetime
+    measurement_date: datetime | None
 
 
 @dataclass(frozen=True)
@@ -253,6 +258,36 @@ class OrderQueueRow:
 
 
 @dataclass(frozen=True)
+class OrderManagementSummaryRow:
+    new_hold_items: int
+    worker_count: int
+    todays_assigned: int
+    total_items: int
+
+
+@dataclass(frozen=True)
+class OrderManagementItemRow:
+    order_item_id: int
+    customer_name: str
+    item_id: str
+    item_name: str
+    item_status: str
+    due_date: datetime | None
+    priority: str
+    status: str
+    assigned_worker_id: str
+    assigned_worker_name: str
+
+
+@dataclass(frozen=True)
+class WorkerAssignmentSummaryRow:
+    worker_id: str
+    worker_name: str
+    total_assigned_items: int
+    inprogress_items: int
+
+
+@dataclass(frozen=True)
 class CustomerOrderHistoryRow:
     order_id: str
     title: str
@@ -260,6 +295,7 @@ class CustomerOrderHistoryRow:
     due_date: datetime | None
     priority: str
     order_status: str
+    bill_status: str
     created_by: str
     order_total: Decimal
     paid_amount: Decimal
@@ -288,6 +324,7 @@ class OperationsService:
         "INPROGRESS",
         "HOLD",
         "READY",
+        "DWP",
         "DELIVERED",
         "CANCELED",
         "FULFILLED",
@@ -425,6 +462,259 @@ class OperationsService:
                 )
                 for customer, order, item in rows
             )
+
+    def order_management_summary_for_store(
+        self,
+        *,
+        store_id: str,
+        worker_count: int,
+        due_date: datetime | None = None,
+    ) -> OrderManagementSummaryRow:
+        normalized_store_id = store_id.strip()
+        if not normalized_store_id:
+            return OrderManagementSummaryRow(
+                new_hold_items=0,
+                worker_count=max(0, worker_count),
+                todays_assigned=0,
+                total_items=0,
+            )
+
+        normalized_due_date = self._ensure_optional_utc(due_date)
+        today = datetime.now(tz=timezone.utc).date()
+        with self._session_factory() as session:
+            statement = (
+                select(OrderItemModel)
+                .join(OrderModel, OrderModel.order_id == OrderItemModel.order_id)
+                .join(CustomerModel, CustomerModel.customer_id == OrderModel.customer_id)
+                .where(CustomerModel.store_id == normalized_store_id)
+                .where(OrderItemModel.status.in_(("NEW", "HOLD", "ASSIGNED")))
+            )
+            if normalized_due_date is not None:
+                start = normalized_due_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                end = start + timedelta(days=1)
+                statement = statement.where(OrderModel.due_on >= start, OrderModel.due_on < end)
+            rows = session.scalars(statement).all()
+            return OrderManagementSummaryRow(
+                new_hold_items=sum(1 for row in rows if row.status in {"NEW", "HOLD"}),
+                worker_count=max(0, worker_count),
+                todays_assigned=sum(
+                    1
+                    for row in rows
+                    if row.assigned_on is not None
+                    and self._ensure_utc(row.assigned_on).date() == today
+                ),
+                total_items=len(rows),
+            )
+
+    def list_worker_assignment_summary_for_store(
+        self,
+        *,
+        store_id: str,
+    ) -> tuple[WorkerAssignmentSummaryRow, ...]:
+        normalized_store_id = store_id.strip()
+        if not normalized_store_id:
+            return ()
+
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(OrderItemModel)
+                .join(OrderModel, OrderModel.order_id == OrderItemModel.order_id)
+                .join(CustomerModel, CustomerModel.customer_id == OrderModel.customer_id)
+                .where(CustomerModel.store_id == normalized_store_id)
+                .where(OrderItemModel.assigned_worker_id != "")
+            ).all()
+            summaries: dict[str, dict[str, object]] = {}
+            for row in rows:
+                summary = summaries.setdefault(
+                    row.assigned_worker_id,
+                    {
+                        "worker_id": row.assigned_worker_id,
+                        "worker_name": row.assigned_worker_name,
+                        "total_assigned_items": 0,
+                        "inprogress_items": 0,
+                    },
+                )
+                summary["worker_name"] = row.assigned_worker_name
+                if row.status == "ASSIGNED":
+                    summary["total_assigned_items"] = int(summary["total_assigned_items"]) + 1
+                if row.status == "INSTITCHING":
+                    summary["inprogress_items"] = int(summary["inprogress_items"]) + 1
+            return tuple(
+                WorkerAssignmentSummaryRow(
+                    worker_id=str(row["worker_id"]),
+                    worker_name=str(row["worker_name"]),
+                    total_assigned_items=int(row["total_assigned_items"]),
+                    inprogress_items=int(row["inprogress_items"]),
+                )
+                for row in sorted(summaries.values(), key=lambda item: str(item["worker_name"]).lower())
+            )
+
+    def list_order_management_items_for_store(
+        self,
+        *,
+        store_id: str,
+        due_date: datetime | None = None,
+    ) -> tuple[OrderManagementItemRow, ...]:
+        normalized_store_id = store_id.strip()
+        if not normalized_store_id:
+            return ()
+        normalized_due_date = self._ensure_optional_utc(due_date)
+
+        with self._session_factory() as session:
+            statement = (
+                select(OrderModel, OrderItemModel)
+                .join(CustomerModel, CustomerModel.customer_id == OrderModel.customer_id)
+                .join(OrderItemModel, OrderItemModel.order_id == OrderModel.order_id)
+                .where(CustomerModel.store_id == normalized_store_id)
+                .where(OrderItemModel.status.in_(("NEW", "HOLD", "ASSIGNED")))
+                .order_by(
+                    (OrderItemModel.status != "NEW").asc(),
+                    OrderModel.due_on.asc(),
+                    OrderModel.priority.asc(),
+                    OrderItemModel.order_item_id.asc(),
+                )
+            )
+            if normalized_due_date is not None:
+                start = normalized_due_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                end = start + timedelta(days=1)
+                statement = statement.where(OrderModel.due_on >= start, OrderModel.due_on < end)
+            rows = session.execute(statement).all()
+            return tuple(
+                OrderManagementItemRow(
+                    order_item_id=item.order_item_id,
+                    customer_name=order.customer.full_name,
+                    item_id=item.item_id,
+                    item_name=item.item_name,
+                    item_status=item.status,
+                    due_date=self._ensure_optional_utc(order.due_on),
+                    priority=order.priority,
+                    status=order.status,
+                    assigned_worker_id=item.assigned_worker_id,
+                    assigned_worker_name=item.assigned_worker_name,
+                )
+                for order, item in rows
+            )
+
+    def list_work_management_items_for_store(
+        self,
+        *,
+        store_id: str,
+        worker_id: str = "",
+    ) -> tuple[OrderManagementItemRow, ...]:
+        normalized_store_id = store_id.strip()
+        normalized_worker_id = worker_id.strip()
+        if not normalized_store_id:
+            return ()
+
+        with self._session_factory() as session:
+            statement = (
+                select(OrderModel, OrderItemModel)
+                .join(CustomerModel, CustomerModel.customer_id == OrderModel.customer_id)
+                .join(OrderItemModel, OrderItemModel.order_id == OrderModel.order_id)
+                .where(CustomerModel.store_id == normalized_store_id)
+                .where(OrderItemModel.assigned_worker_id != "")
+                .order_by(
+                    OrderItemModel.assigned_worker_name.asc(),
+                    OrderModel.due_on.asc(),
+                    OrderModel.priority.asc(),
+                    OrderItemModel.order_item_id.asc(),
+                )
+            )
+            if normalized_worker_id:
+                statement = statement.where(OrderItemModel.assigned_worker_id == normalized_worker_id)
+            rows = session.execute(statement).all()
+            return tuple(
+                OrderManagementItemRow(
+                    order_item_id=item.order_item_id,
+                    customer_name=order.customer.full_name,
+                    item_id=item.item_id,
+                    item_name=item.item_name,
+                    item_status=item.status,
+                    due_date=self._ensure_optional_utc(order.due_on),
+                    priority=order.priority,
+                    status=order.status,
+                    assigned_worker_id=item.assigned_worker_id,
+                    assigned_worker_name=item.assigned_worker_name,
+                )
+                for order, item in rows
+            )
+
+    def assign_order_item_to_worker(
+        self,
+        *,
+        store_id: str,
+        order_item_id: int,
+        worker_id: str,
+        worker_name: str,
+    ) -> None:
+        normalized_store_id = store_id.strip()
+        normalized_worker_id = worker_id.strip()
+        normalized_worker_name = worker_name.strip()
+        if not normalized_store_id or order_item_id <= 0 or not normalized_worker_id:
+            raise ValueError("Store, order item, and worker are required before assigning work.")
+
+        with self._session_factory() as session:
+            order_item = session.scalar(
+                select(OrderItemModel)
+                .join(OrderModel, OrderModel.order_id == OrderItemModel.order_id)
+                .join(CustomerModel, CustomerModel.customer_id == OrderModel.customer_id)
+                .where(
+                    CustomerModel.store_id == normalized_store_id,
+                    OrderItemModel.order_item_id == order_item_id,
+                )
+            )
+            if order_item is None:
+                raise ValueError("The selected order item could not be found for this store.")
+            now = datetime.now(tz=timezone.utc)
+            order_item.assigned_worker_id = normalized_worker_id
+            order_item.assigned_worker_name = normalized_worker_name
+            order_item.assigned_on = now
+            order_item.status = "ASSIGNED"
+            order_item.updated_on = now
+            session.commit()
+
+    def update_order_item_status_for_store(
+        self,
+        *,
+        store_id: str,
+        order_item_id: int,
+        status: str,
+    ) -> None:
+        normalized_store_id = store_id.strip()
+        normalized_status = status.strip().upper()
+        if not normalized_store_id or order_item_id <= 0:
+            raise ValueError("Store and order item are required before updating item status.")
+        if normalized_status not in {"INSTITCHING", "READY", "HOLD"}:
+            raise ValueError("Item status must be INSTITCHING, READY, or HOLD.")
+
+        with self._session_factory() as session:
+            order_item = session.scalar(
+                select(OrderItemModel)
+                .join(OrderModel, OrderModel.order_id == OrderItemModel.order_id)
+                .join(CustomerModel, CustomerModel.customer_id == OrderModel.customer_id)
+                .where(
+                    CustomerModel.store_id == normalized_store_id,
+                    OrderItemModel.order_item_id == order_item_id,
+                )
+            )
+            if order_item is None:
+                raise ValueError("The selected order item could not be found for this store.")
+            previous_status = order_item.status
+            now = datetime.now(tz=timezone.utc)
+            order_item.status = normalized_status
+            order_item.updated_on = now
+            order = order_item.order
+            if (
+                previous_status == "ASSIGNED"
+                and normalized_status == "INSTITCHING"
+                and order.status == "NEW"
+            ):
+                order.status = "INPROGRESS"
+                order.updated_on = now
+            if order.items and all(item.status == "READY" for item in order.items):
+                order.status = "READY"
+                order.updated_on = now
+            session.commit()
 
     def list_items(self, *, store_id: str) -> tuple[ItemRow, ...]:
         normalized_store_id = store_id.strip()
@@ -600,17 +890,52 @@ class OperationsService:
             ).all()
             return tuple(self._to_order_item_row(row) for row in rows)
 
-    def list_measurements_for_customer(self, *, customer_id: str) -> tuple[MeasurementRow, ...]:
+    def list_measurements_for_customer(
+        self,
+        *,
+        customer_id: str,
+        store_id: str | None = None,
+    ) -> tuple[MeasurementRow, ...]:
         normalized_customer_id = customer_id.strip()
         if not normalized_customer_id:
             return ()
+        normalized_store_id = store_id.strip() if store_id is not None else ""
         with self._session_factory() as session:
-            rows = session.scalars(
+            if self._backfill_measurements_for_customer(
+                session=session,
+                customer_id=normalized_customer_id,
+            ):
+                session.commit()
+            measurement_rows = session.scalars(
                 select(MeasurementModel)
                 .where(MeasurementModel.customer_id == normalized_customer_id)
                 .order_by(MeasurementModel.measurement_date.desc(), MeasurementModel.measurement_id.desc())
             ).all()
-            return tuple(self._to_measurement_row(row) for row in rows)
+            measurement_by_item_id: dict[str, MeasurementRow] = {}
+            for row in measurement_rows:
+                measurement_by_item_id.setdefault(row.item_id, self._to_measurement_row(row))
+            if not normalized_store_id:
+                return tuple(measurement_by_item_id.values())
+
+            items = session.scalars(
+                select(ItemModel)
+                .where(ItemModel.store_id == normalized_store_id)
+                .order_by(ItemModel.item_name.asc())
+            ).all()
+            return tuple(
+                measurement_by_item_id.get(
+                    item.item_id,
+                    MeasurementRow(
+                        measurement_id=None,
+                        customer_id=normalized_customer_id,
+                        item_id=item.item_id,
+                        item_name=item.item_name,
+                        measurements="",
+                        measurement_date=None,
+                    ),
+                )
+                for item in items
+            )
 
     def list_customer_order_history_for_store(
         self,
@@ -642,6 +967,7 @@ class OperationsService:
                     due_date=self._ensure_optional_utc(order.due_on),
                     priority=order.priority,
                     order_status=order.status,
+                    bill_status=order.bill_status,
                     created_by=order.created_by,
                     order_total=Decimal(order.order_total).quantize(Decimal("0.01")),
                     paid_amount=Decimal(order.paid_amount).quantize(Decimal("0.01")),
@@ -871,6 +1197,7 @@ class OperationsService:
                 quantity=quantity,
                 order_total=order_total.quantize(Decimal("0.01")),
                 paid_amount=Decimal("0.00"),
+                bill_status="UNPAID",
                 status=status,
                 notes=notes.strip(),
                 created_on=now,
@@ -912,6 +1239,10 @@ class OperationsService:
                 order.order_total = order_total.quantize(Decimal("0.01"))
 
             order.status = status
+            order.bill_status = self._bill_status_for_amounts(
+                Decimal(order.order_total),
+                Decimal(order.paid_amount),
+            )
             order.notes = notes.strip()
             order.updated_on = datetime.now(tz=timezone.utc)
             self._recalculate_customer_billing(order.customer)
@@ -950,8 +1281,6 @@ class OperationsService:
         normalized_order_id = order_id.strip()
         if not normalized_store_id or not normalized_customer_id or not normalized_order_id:
             raise ValueError("Store, customer, and order are required before recording payment.")
-        if paid_amount <= Decimal("0.00"):
-            raise ValueError("Payment amount must be greater than zero.")
 
         with self._session_factory() as session:
             order = session.scalar(
@@ -969,11 +1298,24 @@ class OperationsService:
             payment_amount = paid_amount.quantize(Decimal("0.01"))
             current_paid = Decimal(order.paid_amount).quantize(Decimal("0.01"))
             order_total = Decimal(order.order_total).quantize(Decimal("0.01"))
-            if current_paid + payment_amount > order_total:
+            normalized_notes = notes.strip()
+            if payment_amount < Decimal("0.00"):
+                raise ValueError("Payment amount cannot be negative.")
+            if payment_amount == Decimal("0.00"):
+                if not normalized_notes:
+                    raise ValueError("Payment amount must be greater than zero unless notes are provided.")
+                if order.status == "READY" and order.bill_status == "UNPAID":
+                    order.status = "DWP"
+                    order.notes = normalized_notes
+            if payment_amount > Decimal("0.00") and current_paid + payment_amount > order_total:
                 raise ValueError("Payment amount cannot be greater than the selected order balance.")
+            if payment_amount == Decimal("0.00"):
+                if current_paid > order_total:
+                    raise ValueError("The selected order is already overpaid.")
 
             now = datetime.now(tz=timezone.utc)
             order.paid_amount = (current_paid + payment_amount).quantize(Decimal("0.01"))
+            order.bill_status = self._bill_status_for_amounts(order_total, order.paid_amount)
             order.updated_on = now
             order.payments.append(
                 PaymentModel(
@@ -981,7 +1323,7 @@ class OperationsService:
                     customer_id=normalized_customer_id,
                     paid_amount=payment_amount,
                     payment_method=payment_method.strip(),
-                    notes=notes.strip(),
+                    notes=normalized_notes,
                     payment_date=now,
                 )
             )
@@ -990,6 +1332,37 @@ class OperationsService:
                 Decimal(customer.received_amount) + payment_amount
             ).quantize(Decimal("0.01"))
             self._recalculate_customer_billing(customer)
+            session.commit()
+
+    def mark_order_delivered_for_store(
+        self,
+        *,
+        store_id: str,
+        customer_id: str,
+        order_id: str,
+    ) -> None:
+        normalized_store_id = store_id.strip()
+        normalized_customer_id = customer_id.strip()
+        normalized_order_id = order_id.strip()
+        if not normalized_store_id or not normalized_customer_id or not normalized_order_id:
+            raise ValueError("Store, customer, and order are required before marking delivery.")
+
+        with self._session_factory() as session:
+            order = session.scalar(
+                select(OrderModel)
+                .join(CustomerModel, CustomerModel.customer_id == OrderModel.customer_id)
+                .where(
+                    CustomerModel.store_id == normalized_store_id,
+                    OrderModel.customer_id == normalized_customer_id,
+                    OrderModel.order_id == normalized_order_id,
+                )
+            )
+            if order is None:
+                raise ValueError("The selected order could not be found for this customer.")
+            if order.bill_status != "PAID":
+                raise ValueError("Only paid orders can be marked delivered.")
+            order.status = "DELIVERED"
+            order.updated_on = datetime.now(tz=timezone.utc)
             session.commit()
 
     def update_measurement_for_store(
@@ -1022,6 +1395,115 @@ class OperationsService:
             measurement.measurements = measurements.strip()
             measurement.measurement_date = datetime.now(tz=timezone.utc)
             session.commit()
+
+    def save_measurement_for_store(
+        self,
+        *,
+        store_id: str,
+        customer_id: str,
+        item_id: str,
+        item_name: str,
+        measurements: str,
+        measurement_id: int | None = None,
+    ) -> None:
+        normalized_store_id = store_id.strip()
+        normalized_customer_id = customer_id.strip()
+        normalized_item_id = item_id.strip()
+        normalized_item_name = item_name.strip()
+        normalized_measurements = measurements.strip()
+        if not normalized_store_id or not normalized_customer_id or not normalized_item_id:
+            raise ValueError("Store, customer, and item are required before saving measurements.")
+        if not normalized_measurements:
+            return
+
+        with self._session_factory() as session:
+            customer = session.scalar(
+                select(CustomerModel).where(
+                    CustomerModel.store_id == normalized_store_id,
+                    CustomerModel.customer_id == normalized_customer_id,
+                )
+            )
+            if customer is None:
+                raise ValueError("The selected customer could not be found for this store.")
+            item = session.scalar(
+                select(ItemModel).where(
+                    ItemModel.store_id == normalized_store_id,
+                    ItemModel.item_id == normalized_item_id,
+                )
+            )
+            if item is None:
+                raise ValueError("The selected item could not be found for this store.")
+
+            measurement = None
+            if measurement_id is not None:
+                measurement = session.scalar(
+                    select(MeasurementModel).where(
+                        MeasurementModel.customer_id == normalized_customer_id,
+                        MeasurementModel.measurement_id == measurement_id,
+                    )
+                )
+            if measurement is None:
+                measurement = session.scalar(
+                    select(MeasurementModel).where(
+                        MeasurementModel.customer_id == normalized_customer_id,
+                        MeasurementModel.item_id == normalized_item_id,
+                    )
+                )
+
+            now = datetime.now(tz=timezone.utc)
+            if measurement is None:
+                measurement = MeasurementModel(
+                    customer_id=normalized_customer_id,
+                    item_id=normalized_item_id,
+                    item_name=normalized_item_name or item.item_name,
+                    measurements=normalized_measurements,
+                    measurement_date=now,
+                )
+                session.add(measurement)
+            else:
+                measurement.measurements = normalized_measurements
+                measurement.measurement_date = now
+            session.flush()
+            session.commit()
+
+    def _backfill_measurements_for_customer(self, *, session: Session, customer_id: str) -> bool:
+        order_items = session.scalars(
+            select(OrderItemModel)
+            .join(OrderModel, OrderModel.order_id == OrderItemModel.order_id)
+            .where(
+                OrderModel.customer_id == customer_id,
+                OrderItemModel.measurement_id.is_(None),
+                OrderItemModel.measurements != "",
+            )
+            .order_by(OrderItemModel.updated_on.asc(), OrderItemModel.order_item_id.asc())
+        ).all()
+        changed = False
+        for order_item in order_items:
+            measurement_text = order_item.measurements.strip()
+            if not measurement_text:
+                continue
+            measurement = session.scalar(
+                select(MeasurementModel).where(
+                    MeasurementModel.customer_id == customer_id,
+                    MeasurementModel.item_id == order_item.item_id,
+                    MeasurementModel.measurements == measurement_text,
+                )
+            )
+            if measurement is None:
+                measurement = MeasurementModel(
+                    customer_id=customer_id,
+                    item_id=order_item.item_id,
+                    item_name=order_item.item_name,
+                    measurements=measurement_text,
+                    measurement_date=self._ensure_utc(order_item.updated_on),
+                )
+                session.add(measurement)
+                session.flush()
+            order_item.measurement = measurement
+            changed = True
+        if changed:
+            session.flush()
+        return changed
 
     def _recalculate_customer_billing(self, customer: CustomerModel) -> None:
         total_billing = Decimal("0.00")
@@ -1062,6 +1544,7 @@ class OperationsService:
             order_total=Decimal("0.00"),
             paid_amount=order_input.paid_amount.quantize(Decimal("0.01")),
             status=normalized_status,
+            bill_status=self._bill_status_for_amounts(Decimal("0.00"), order_input.paid_amount),
             notes="",
             due_on=self._ensure_optional_utc(order_input.due_on),
             priority=normalized_priority,
@@ -1112,6 +1595,7 @@ class OperationsService:
         order.order_total = order_total.quantize(Decimal("0.01"))
         if order.paid_amount > order.order_total:
             raise ValueError("Paid amount cannot be greater than order total.")
+        order.bill_status = self._bill_status_for_amounts(order.order_total, order.paid_amount)
         if order.paid_amount > Decimal("0.00"):
             order.payments.append(
                 PaymentModel(
@@ -1142,10 +1626,14 @@ class OperationsService:
                 "priority": "ALTER TABLE ops_orders ADD COLUMN priority VARCHAR(40) NOT NULL DEFAULT 'Medium'",
                 "created_by": "ALTER TABLE ops_orders ADD COLUMN created_by VARCHAR(150) NOT NULL DEFAULT ''",
                 "paid_amount": "ALTER TABLE ops_orders ADD COLUMN paid_amount NUMERIC(12, 2) NOT NULL DEFAULT 0",
+                "bill_status": "ALTER TABLE ops_orders ADD COLUMN bill_status VARCHAR(40) NOT NULL DEFAULT 'UNPAID'",
             },
             "ops_order_items": {
                 "measurement_id": "ALTER TABLE ops_order_items ADD COLUMN measurement_id INTEGER",
                 "measurements": "ALTER TABLE ops_order_items ADD COLUMN measurements VARCHAR(240) NOT NULL DEFAULT ''",
+                "assigned_worker_id": "ALTER TABLE ops_order_items ADD COLUMN assigned_worker_id VARCHAR(50) NOT NULL DEFAULT ''",
+                "assigned_worker_name": "ALTER TABLE ops_order_items ADD COLUMN assigned_worker_name VARCHAR(150) NOT NULL DEFAULT ''",
+                "assigned_on": "ALTER TABLE ops_order_items ADD COLUMN assigned_on DATETIME",
             },
         }
 
@@ -1163,12 +1651,47 @@ class OperationsService:
                 if column_name not in existing_columns
             )
 
-        if not missing_statements:
-            return
+        if missing_statements:
+            with self._engine.begin() as connection:
+                for statement in missing_statements:
+                    connection.exec_driver_sql(statement)
+        self._sync_order_bill_statuses()
+        self._sync_order_item_statuses()
 
-        with self._engine.begin() as connection:
-            for statement in missing_statements:
-                connection.exec_driver_sql(statement)
+    def _sync_order_bill_statuses(self) -> None:
+        with self._session_factory() as session:
+            rows = session.scalars(select(OrderModel)).all()
+            changed = False
+            for row in rows:
+                bill_status = self._bill_status_for_amounts(
+                    Decimal(row.order_total),
+                    Decimal(row.paid_amount),
+                )
+                if row.bill_status != bill_status:
+                    row.bill_status = bill_status
+                    changed = True
+            if changed:
+                session.commit()
+
+    def _sync_order_item_statuses(self) -> None:
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(OrderItemModel).where(OrderItemModel.status == "INSTITCCHING")
+            ).all()
+            if not rows:
+                return
+            for row in rows:
+                row.status = "INSTITCHING"
+            session.commit()
+
+    def _bill_status_for_amounts(self, order_total: Decimal, paid_amount: Decimal) -> str:
+        normalized_total = Decimal(order_total).quantize(Decimal("0.01"))
+        normalized_paid = Decimal(paid_amount).quantize(Decimal("0.01"))
+        if normalized_total <= Decimal("0.00") or normalized_paid <= Decimal("0.00"):
+            return "UNPAID"
+        if normalized_paid >= normalized_total:
+            return "PAID"
+        return "PARTPAID"
 
     def _customer_search_filter(self, normalized_query: str):
         return (
@@ -1202,6 +1725,8 @@ class OperationsService:
                     title="Seasonal inventory batch",
                     quantity=10,
                     order_total=Decimal("600.00"),
+                    paid_amount=Decimal("600.00"),
+                    bill_status="PAID",
                     status="FULFILLED",
                     notes="Paid in full and closed.",
                     created_on=now - timedelta(days=10),
@@ -1228,6 +1753,8 @@ class OperationsService:
                     title="Cold storage shipment",
                     quantity=6,
                     order_total=Decimal("450.00"),
+                    paid_amount=Decimal("0.00"),
+                    bill_status="UNPAID",
                     status="READY",
                     notes="Waiting for dispatch window.",
                     created_on=now - timedelta(days=4),
@@ -1239,6 +1766,8 @@ class OperationsService:
                     title="Return pallet recovery",
                     quantity=2,
                     order_total=Decimal("150.00"),
+                    paid_amount=Decimal("0.00"),
+                    bill_status="UNPAID",
                     status="INPROGRESS",
                     notes="Processing in warehouse.",
                     created_on=now - timedelta(days=2),
@@ -1274,6 +1803,7 @@ class OperationsService:
             quantity=row.quantity,
             order_total=Decimal(row.order_total).quantize(Decimal("0.01")),
             paid_amount=Decimal(row.paid_amount).quantize(Decimal("0.01")),
+            bill_status=row.bill_status,
             status=row.status,
             notes=row.notes,
             due_on=self._ensure_optional_utc(row.due_on),

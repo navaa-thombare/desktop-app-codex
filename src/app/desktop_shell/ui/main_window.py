@@ -45,6 +45,8 @@ from app.authorization.services import (
 )
 from app.desktop_shell.ui.admin_management import AccessControlWorkspace
 from app.desktop_shell.ui.manager_customer import StoreManagerCustomerDashboardScreen
+from app.desktop_shell.ui.manager_orders import StoreManagerOrdersManagementScreen
+from app.desktop_shell.ui.manager_work import StoreManagerWorkManagementScreen
 from app.operations.services import ItemRow, OperationsService
 from app.platform.audit import AuditReviewService, AuditService
 
@@ -1909,6 +1911,8 @@ class MainWindow(QMainWindow):
         self.nav_admin_button = QPushButton("Admin Console")
         self.nav_create_staff_button = QPushButton("Create Staff")
         self.nav_create_items_button = QPushButton("Create Items")
+        self.nav_orders_management_button = QPushButton("Orders Assignment")
+        self.nav_work_management_button = QPushButton("Work Management")
         self.nav_billing_button = QPushButton("Billing")
         self.logout_button = QPushButton("Sign out")
         self.logout_button.setObjectName("SecondaryButton")
@@ -1919,6 +1923,8 @@ class MainWindow(QMainWindow):
             "admin": self.nav_admin_button,
             "create_staff": self.nav_create_staff_button,
             "create_items": self.nav_create_items_button,
+            "orders_management": self.nav_orders_management_button,
+            "work_management": self.nav_work_management_button,
             "billing": self.nav_billing_button,
         }
         for route_key, button in self._nav_buttons.items():
@@ -1972,12 +1978,24 @@ class MainWindow(QMainWindow):
             on_item_created=self._handle_store_item_created,
             parent=self,
         )
+        self.orders_management_page = StoreManagerOrdersManagementScreen(
+            user_management_service=self._admin_user_management_service,
+            operations_service=self._operations_service,
+            parent=self,
+        )
+        self.work_management_page = StoreManagerWorkManagementScreen(
+            user_management_service=self._admin_user_management_service,
+            operations_service=self._operations_service,
+            parent=self,
+        )
         self.billing_page = self._build_billing_page()
 
         self.route_stack.addWidget(self.home_page)
         self.route_stack.addWidget(self.admin_page)
         self.route_stack.addWidget(self.create_staff_page)
         self.route_stack.addWidget(self.create_items_page)
+        self.route_stack.addWidget(self.orders_management_page)
+        self.route_stack.addWidget(self.work_management_page)
         self.route_stack.addWidget(self.billing_page)
 
         self._route_config = {
@@ -2000,6 +2018,16 @@ class MainWindow(QMainWindow):
                 "title": "Create Items",
                 "subtitle": "Create store items and keep the item catalog current.",
                 "widget": self.create_items_page,
+            },
+            "orders_management": {
+                "title": "Orders Assignment",
+                "subtitle": "",
+                "widget": self.orders_management_page,
+            },
+            "work_management": {
+                "title": "Work Management",
+                "subtitle": "",
+                "widget": self.work_management_page,
             },
             "billing": {
                 "title": "Billing",
@@ -2384,20 +2412,29 @@ class MainWindow(QMainWindow):
         if store_scoped_mode:
             route_permissions = {
                 "home": True,
-                "admin": self._authorization_guard.can(permission="nav:admin", context=context),
+                "admin": store_admin_mode
+                and self._authorization_guard.can(permission="nav:admin", context=context),
                 "create_staff": store_admin_mode and self._admin_user_management_service.can_actor_create_users(
                     self._current_user_id
                 ),
                 "create_items": store_admin_mode,
+                "orders_management": self._is_store_manager_mode(),
+                "work_management": self._is_store_manager_mode(),
                 "billing": False,
             }
-            visible_routes = {"home", "admin", "create_staff", "create_items"}
+            visible_routes = (
+                {"home", "orders_management", "work_management"}
+                if self._is_store_manager_mode()
+                else {"home", "admin", "create_staff", "create_items"}
+            )
         else:
             route_permissions = {
                 "home": self._authorization_guard.can(permission="nav:home", context=context),
                 "admin": self._authorization_guard.can(permission="nav:admin", context=context),
                 "create_staff": False,
                 "create_items": False,
+                "orders_management": False,
+                "work_management": False,
                 "billing": self._authorization_guard.can(permission="nav:billing", context=context),
             }
             visible_routes = {"home", "admin", "billing"}
@@ -2411,6 +2448,10 @@ class MainWindow(QMainWindow):
                 tooltip_key = "store staff creation"
             elif route_key == "create_items":
                 tooltip_key = "store item creation"
+            elif route_key == "orders_management":
+                tooltip_key = "orders assignment"
+            elif route_key == "work_management":
+                tooltip_key = "work management"
             else:
                 tooltip_key = route_key
             button.setToolTip("" if is_allowed else f"Access denied for {tooltip_key}.")
@@ -2429,7 +2470,7 @@ class MainWindow(QMainWindow):
         ):
             return "admin"
         route_order = (
-            ("home", "admin", "create_staff", "create_items")
+            ("home", "orders_management", "work_management", "admin", "create_staff", "create_items")
             if self._is_store_scoped_workspace_mode()
             else ("home", "admin", "billing")
         )
@@ -2448,11 +2489,18 @@ class MainWindow(QMainWindow):
 
         route = self._route_config[route_key]
         self._active_route = route_key
+        if route_key == "orders_management":
+            self.orders_management_page.refresh_data()
+        elif route_key == "work_management":
+            self.work_management_page.refresh_data()
         self.route_stack.setCurrentWidget(route["widget"])
         self.page_title_label.setText(route["title"])
+        hide_route_heading = route_key in {"orders_management", "work_management"}
+        self.page_eyebrow.setVisible(not hide_route_heading)
+        self.page_title_label.setVisible(not hide_route_heading)
         route_subtitle = route["subtitle"]
         self.page_subtitle_label.setText(route_subtitle)
-        self.page_subtitle_label.setVisible(bool(route_subtitle))
+        self.page_subtitle_label.setVisible(bool(route_subtitle) and not hide_route_heading)
         self.setWindowTitle(f"{self._app_name} | {route['title']}")
 
         for key, nav_button in self._nav_buttons.items():
@@ -2484,6 +2532,8 @@ class MainWindow(QMainWindow):
         self.admin_page.set_current_user_id(None)
         self.create_staff_page.set_current_user_id(None)
         self.create_items_page.set_current_user_id(None)
+        self.orders_management_page.clear_context()
+        self.work_management_page.clear_context()
         self.identifier_input.clear()
         self.password_input.clear()
         self.recovery_identifier_input.clear()
@@ -2518,6 +2568,8 @@ class MainWindow(QMainWindow):
         self.home_store_details_label.setText("")
         self.store_home_page.clear_context()
         self.store_manager_home_page.clear_context()
+        self.orders_management_page.clear_context()
+        self.work_management_page.clear_context()
         self.home_mode_stack.setCurrentWidget(self.default_home_page)
         self.create_staff_page.set_current_user_id(None)
         self.create_items_page.set_current_user_id(None)
@@ -2525,6 +2577,8 @@ class MainWindow(QMainWindow):
             "Sign in to populate session metadata and route-aware workspace details."
         )
         self.page_title_label.setText("Home")
+        self.page_eyebrow.show()
+        self.page_title_label.show()
         self.page_subtitle_label.setText("Use the navigation rail to move through the app.")
         self.page_subtitle_label.show()
         self.route_stack.setCurrentWidget(self.home_page)
@@ -2537,6 +2591,8 @@ class MainWindow(QMainWindow):
         self.nav_billing_button.show()
         self.nav_create_staff_button.hide()
         self.nav_create_items_button.hide()
+        self.nav_orders_management_button.hide()
+        self.nav_work_management_button.hide()
         self.report_button.setEnabled(False)
         self._active_route = "home"
         self._update_workspace_chrome_visibility()
@@ -2640,6 +2696,8 @@ class MainWindow(QMainWindow):
         )
         self.nav_create_staff_button.setText("Create Staff")
         self.nav_create_items_button.setText("Create Items")
+        self.nav_orders_management_button.setText("Orders Assignment")
+        self.nav_work_management_button.setText("Work Management")
         self._refresh_home_route_content()
 
     def _refresh_store_scoped_shell(self, *, identifier: str, expiry: str) -> None:
@@ -2712,6 +2770,8 @@ class MainWindow(QMainWindow):
             return
 
         if self._is_store_admin_mode() and self._store_dashboard_context is not None:
+            self.orders_management_page.clear_context()
+            self.work_management_page.clear_context()
             self.store_home_page.set_context(
                 current_user_id=self._current_user_id,
                 store_context=self._store_dashboard_context,
@@ -2725,15 +2785,27 @@ class MainWindow(QMainWindow):
                 current_user_id=self._current_user_id,
                 store_context=self._store_dashboard_context,
             )
+            self.orders_management_page.set_context(
+                current_user_id=self._current_user_id,
+                store_context=self._store_dashboard_context,
+            )
+            self.work_management_page.set_context(
+                current_user_id=self._current_user_id,
+                store_context=self._store_dashboard_context,
+            )
             self.home_mode_stack.setCurrentWidget(self.store_manager_home_page)
             return
 
         if self._is_store_worker_mode() and self._store_dashboard_context is not None:
             self.store_home_page.clear_context()
+            self.orders_management_page.clear_context()
+            self.work_management_page.clear_context()
             self.home_mode_stack.setCurrentWidget(self.store_worker_home_page)
             return
 
         self.store_home_page.clear_context()
+        self.orders_management_page.clear_context()
+        self.work_management_page.clear_context()
         self.home_mode_stack.setCurrentWidget(self.default_home_page)
 
     def _refresh_store_admin_views(self) -> None:
@@ -2768,13 +2840,19 @@ class MainWindow(QMainWindow):
     def _update_workspace_chrome_visibility(self) -> None:
         store_scoped_mode = self._is_store_scoped_workspace_mode()
         store_dashboard_mode = store_scoped_mode and self._active_route == "home"
+        full_content_mode = store_scoped_mode and self._active_route in {
+            "orders_management",
+            "work_management",
+        }
 
         self.workspace_eyebrow.setVisible(not store_scoped_mode)
         self.sidebar_store_card.setVisible(not store_scoped_mode)
-        self.page_eyebrow.setVisible(not store_dashboard_mode)
-        self.page_title_label.setVisible(not store_dashboard_mode)
+        self.page_eyebrow.setVisible(not store_dashboard_mode and not full_content_mode)
+        self.page_title_label.setVisible(not store_dashboard_mode and not full_content_mode)
         self.page_subtitle_label.setVisible(
-            (not store_dashboard_mode) and bool(self.page_subtitle_label.text())
+            (not store_dashboard_mode)
+            and (not full_content_mode)
+            and bool(self.page_subtitle_label.text())
         )
         self.workspace_notice.setVisible(
             (not store_dashboard_mode) and bool(self.workspace_notice.text())

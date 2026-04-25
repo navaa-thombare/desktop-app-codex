@@ -1023,6 +1023,36 @@ class AdminUserManagementService:
                 )
             )
 
+    def list_store_workers(self, *, store_id: str) -> tuple[StoreStaffRow, ...]:
+        normalized_store_id = store_id.strip()
+        if not normalized_store_id:
+            return ()
+
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(ManagedUserModel)
+                .where(ManagedUserModel.store_id == normalized_store_id)
+                .order_by(ManagedUserModel.full_name.asc())
+            ).all()
+            creator_lookup = {
+                user.user_id: user.full_name
+                for user in session.scalars(select(ManagedUserModel)).all()
+            }
+            return tuple(
+                StoreStaffRow(
+                    user_id=row.user_id,
+                    full_name=row.full_name,
+                    contact_number=self._contact_number_for_user(row),
+                    speciality=(row.speciality or "").strip(),
+                    joining_date=self._ensure_utc(row.joining_date or row.created_on),
+                    role_name=self._normalized_role_for_existing_user(row),
+                    username=row.username,
+                    created_by_name=creator_lookup.get(row.created_by_user_id or "", ""),
+                )
+                for row in rows
+                if self._normalized_role_for_existing_user(row) == "Worker"
+            )
+
     def get_staff_member_profile(
         self,
         *,

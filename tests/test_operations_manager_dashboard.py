@@ -40,6 +40,7 @@ def test_manager_customer_dashboard_rows_are_store_scoped_and_calculated(tmp_pat
                 priority="Medium",
                 status="NEW",
                 paid_amount=Decimal("500.00"),
+                weight=Decimal("72.50"),
                 items=(
                     OrderItemCreateInput(
                         item_id="item-pant",
@@ -96,6 +97,7 @@ def test_manager_customer_dashboard_rows_are_store_scoped_and_calculated(tmp_pat
     assert {row.customer_name for row in queue} == {"Ajay Thombare"}
     assert {row.due_date for row in queue} == {due_on}
     assert [row.item_name for row in history] == ["Pant", "Shirt"]
+    assert {row.order_quantity for row in history} == {2}
     assert [row.measurements for row in history] == ["waist 34", "chest 40"]
     assert [row.line_amount for row in history] == [Decimal("1000.00"), Decimal("500.00")]
     assert {row.created_by for row in history} == {"Manager User"}
@@ -108,6 +110,7 @@ def test_manager_customer_dashboard_rows_are_store_scoped_and_calculated(tmp_pat
         "Pant": "waist 34",
         "Shirt": "chest 40",
     }
+    assert {row.weight for row in measurements} == {Decimal("72.50")}
     assert {row.measurement_date for row in measurements} == {created_on}
 
     service.add_payment_for_order(
@@ -175,6 +178,207 @@ def test_manager_customer_dashboard_rows_are_store_scoped_and_calculated(tmp_pat
         customer_id=summaries[0].customer_id,
     )
     assert {row.order_status for row in delivered_history} == {"DELIVERED"}
+
+
+def test_ordered_item_and_assignment_rows_expand_by_item_quantity(tmp_path) -> None:
+    db_path = tmp_path / "ops.db"
+    engine = build_engine(f"sqlite+pysqlite:///{db_path}", echo=False)
+    service = OperationsService(
+        engine=engine,
+        session_factory=build_session_factory(engine),
+    )
+
+    due_on = datetime(2026, 5, 2, tzinfo=timezone.utc)
+    service.create_customer_with_orders(
+        store_id="store-1",
+        full_name="Customer A",
+        mobile="9000000100",
+        email="",
+        address="Pune",
+        is_whatsapp=False,
+        orders=[
+            CustomerOrderCreateInput(
+                title="Shirt + Pant",
+                created_by="Manager User",
+                due_on=due_on,
+                priority="High",
+                status="NEW",
+                paid_amount=Decimal("0.00"),
+                weight=Decimal("68.25"),
+                items=(
+                    OrderItemCreateInput(
+                        item_id="item-shirt",
+                        item_name="Shirt",
+                        quantity=3,
+                        measurements="chest 40",
+                        rate=Decimal("500.00"),
+                        status="NEW",
+                        updated_on=datetime.now(tz=timezone.utc),
+                        updated_by="Manager User",
+                    ),
+                    OrderItemCreateInput(
+                        item_id="item-pant",
+                        item_name="Pant",
+                        quantity=2,
+                        measurements="waist 34",
+                        rate=Decimal("700.00"),
+                        status="HOLD",
+                        updated_on=datetime.now(tz=timezone.utc),
+                        updated_by="Manager User",
+                    ),
+                ),
+            )
+        ],
+    )
+
+    ordered_rows = service.list_order_queue_for_store(store_id="store-1")
+    assignment_rows = service.list_order_management_items_for_store(store_id="store-1")
+    summary = service.order_management_summary_for_store(store_id="store-1", worker_count=1)
+
+    assert [row.item_name for row in ordered_rows].count("Shirt") == 3
+    assert [row.item_name for row in ordered_rows].count("Pant") == 2
+    assert len(ordered_rows) == 5
+    assert [row.item_name for row in assignment_rows].count("Shirt") == 3
+    assert [row.item_name for row in assignment_rows].count("Pant") == 2
+    assert len(assignment_rows) == 5
+    assert summary.new_hold_items == 5
+    assert summary.total_items == 5
+
+    history = service.list_customer_order_history_for_store(
+        store_id="store-1",
+        customer_id=service.list_customer_summaries_for_store(store_id="store-1")[0].customer_id,
+    )
+    assert {row.order_quantity for row in history} == {5}
+    assert [row.item_name for row in history].count("Shirt") == 3
+    assert [row.item_name for row in history].count("Pant") == 2
+    assert {row.quantity for row in history} == {1}
+
+
+def test_store_items_include_making_charges(tmp_path) -> None:
+    db_path = tmp_path / "ops.db"
+    engine = build_engine(f"sqlite+pysqlite:///{db_path}", echo=False)
+    service = OperationsService(
+        engine=engine,
+        session_factory=build_session_factory(engine),
+    )
+
+    item_id = service.create_item(
+        store_id="store-1",
+        item_name="Shirt",
+        cost=Decimal("500.00"),
+        making_charges=Decimal("125.50"),
+    )
+    item = service.get_item(store_id="store-1", item_id=item_id)
+
+    assert item is not None
+    assert item.making_charges == Decimal("125.50")
+
+    service.update_item(
+        store_id="store-1",
+        item_id=item_id,
+        item_name="Shirt",
+        cost=Decimal("550.00"),
+        making_charges=Decimal("150.00"),
+    )
+    updated_item = service.get_item(store_id="store-1", item_id=item_id)
+
+    assert updated_item is not None
+    assert updated_item.cost == Decimal("550.00")
+    assert updated_item.making_charges == Decimal("150.00")
+
+
+def test_worker_payment_items_filter_status_worker_and_sum_making_charges(tmp_path) -> None:
+    db_path = tmp_path / "ops.db"
+    engine = build_engine(f"sqlite+pysqlite:///{db_path}", echo=False)
+    service = OperationsService(
+        engine=engine,
+        session_factory=build_session_factory(engine),
+    )
+
+    shirt_id = service.create_item(
+        store_id="store-1",
+        item_name="Shirt",
+        cost=Decimal("500.00"),
+        making_charges=Decimal("125.00"),
+    )
+    pant_id = service.create_item(
+        store_id="store-1",
+        item_name="Pant",
+        cost=Decimal("700.00"),
+        making_charges=Decimal("200.00"),
+    )
+    service.create_customer_with_orders(
+        store_id="store-1",
+        full_name="Payment Customer",
+        mobile="9000000111",
+        email="",
+        address="Pune",
+        is_whatsapp=False,
+        orders=[
+            CustomerOrderCreateInput(
+                title="Shirt + Pant",
+                created_by="Manager User",
+                due_on=datetime(2026, 5, 2, tzinfo=timezone.utc),
+                priority="High",
+                status="NEW",
+                paid_amount=Decimal("0.00"),
+                items=(
+                    OrderItemCreateInput(
+                        item_id=shirt_id,
+                        item_name="Shirt",
+                        quantity=2,
+                        measurements="chest 40",
+                        rate=Decimal("500.00"),
+                        status="NEW",
+                        updated_on=datetime.now(tz=timezone.utc),
+                        updated_by="Manager User",
+                    ),
+                    OrderItemCreateInput(
+                        item_id=pant_id,
+                        item_name="Pant",
+                        quantity=1,
+                        measurements="waist 34",
+                        rate=Decimal("700.00"),
+                        status="HOLD",
+                        updated_on=datetime.now(tz=timezone.utc),
+                        updated_by="Manager User",
+                    ),
+                ),
+            )
+        ],
+    )
+    rows = service.list_order_management_items_for_store(store_id="store-1")
+    shirt_rows = [row for row in rows if row.item_name == "Shirt"]
+    pant_row = next(row for row in rows if row.item_name == "Pant")
+    for shirt_row in shirt_rows:
+        service.assign_order_item_to_worker(
+            store_id="store-1",
+            order_item_id=shirt_row.order_item_id,
+            worker_id="worker-1",
+            worker_name="Worker One",
+        )
+        service.update_order_item_status_for_store(
+            store_id="store-1",
+            order_item_id=shirt_row.order_item_id,
+            status="READY",
+        )
+    service.assign_order_item_to_worker(
+        store_id="store-1",
+        order_item_id=pant_row.order_item_id,
+        worker_id="worker-2",
+        worker_name="Worker Two",
+    )
+
+    all_payment_rows = service.list_worker_payment_items_for_store(store_id="store-1")
+    worker_one_rows = service.list_worker_payment_items_for_store(
+        store_id="store-1",
+        worker_id="worker-1",
+    )
+
+    assert len(all_payment_rows) == 2
+    assert [row.item_name for row in worker_one_rows] == ["Shirt", "Shirt"]
+    assert {row.item_status for row in all_payment_rows} == {"READY"}
+    assert sum((row.making_charges for row in all_payment_rows), Decimal("0.00")) == Decimal("250.00")
 
 
 def test_ready_unpaid_order_can_be_marked_dwp_with_notes(tmp_path) -> None:
@@ -468,6 +672,7 @@ def test_item_status_update_recalculates_only_parent_order_status(tmp_path) -> N
                 priority="Medium",
                 status="NEW",
                 paid_amount=Decimal("0.00"),
+                weight=Decimal("68.25"),
                 items=(
                     OrderItemCreateInput(
                         item_id="item-shirt",
@@ -585,6 +790,7 @@ def test_customer_measurements_include_store_items_and_link_new_orders(tmp_path)
                 priority="Medium",
                 status="NEW",
                 paid_amount=Decimal("0.00"),
+                weight=Decimal("68.25"),
                 items=(
                     OrderItemCreateInput(
                         item_id=shirt_id,
@@ -608,9 +814,11 @@ def test_customer_measurements_include_store_items_and_link_new_orders(tmp_path)
     measurement_lookup = {row.item_name: row for row in measurements}
 
     assert measurement_lookup["Shirt"].measurements == "chest 40"
+    assert measurement_lookup["Shirt"].weight == Decimal("68.25")
     assert measurement_lookup["Shirt"].measurement_id is not None
     assert measurement_lookup["Pant"].measurement_id is None
     assert measurement_lookup["Pant"].measurements == ""
+    assert measurement_lookup["Pant"].weight == Decimal("68.25")
 
     service.save_measurement_for_store(
         store_id="store-1",
@@ -618,6 +826,7 @@ def test_customer_measurements_include_store_items_and_link_new_orders(tmp_path)
         item_id=pant_id,
         item_name="Pant",
         measurements="waist 34",
+        weight=measurement_lookup["Pant"].weight,
     )
     updated_measurements = service.list_measurements_for_customer(
         customer_id=customer_id,
@@ -625,6 +834,7 @@ def test_customer_measurements_include_store_items_and_link_new_orders(tmp_path)
     )
     pant_measurement = next(row for row in updated_measurements if row.item_name == "Pant")
     assert pant_measurement.measurement_id is not None
+    assert pant_measurement.weight == Decimal("68.25")
 
     service.create_order_for_customer(
         store_id="store-1",

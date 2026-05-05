@@ -10,6 +10,7 @@ from uuid import uuid4
 from PySide6.QtCore import QDate, QTimer, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QDateEdit,
     QDialog,
     QFormLayout,
@@ -34,6 +35,7 @@ from app.admin.services import (
     AdminUserManagementService,
     StaffMemberProfile,
     StoreDashboardContext,
+    StoreStaffRow,
 )
 from app.auth.dtos import AuthFailureCode, LoginRequest
 from app.auth.services import AuthService
@@ -44,10 +46,12 @@ from app.authorization.services import (
     ReportingService,
 )
 from app.desktop_shell.ui.admin_management import AccessControlWorkspace
+from app.desktop_shell.i18n import SUPPORTED_LANGUAGES
+from app.desktop_shell.ui.action_logging import install_action_logging, log_ui_action
 from app.desktop_shell.ui.manager_customer import StoreManagerCustomerDashboardScreen
 from app.desktop_shell.ui.manager_orders import StoreManagerOrdersManagementScreen
 from app.desktop_shell.ui.manager_work import StoreManagerWorkManagementScreen
-from app.operations.services import ItemRow, OperationsService
+from app.operations.services import ItemRow, OperationsService, WorkerPaymentItemRow
 from app.platform.audit import AuditReviewService, AuditService
 
 
@@ -274,11 +278,13 @@ class StoreAdminDashboardScreen(QWidget):
         *,
         user_management_service: AdminUserManagementService,
         operations_service: OperationsService,
+        on_manager_language_changed: Callable[[], None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._user_management_service = user_management_service
         self._operations_service = operations_service
+        self._on_manager_language_changed = on_manager_language_changed
         self._current_user_id: str | None = None
         self._store_context: StoreDashboardContext | None = None
 
@@ -297,9 +303,7 @@ class StoreAdminDashboardScreen(QWidget):
 
         self.staff_table = self._build_table(("Full Name", "Role"))
         self.items_table = self._build_table(("Item Name", "Cost"))
-        self.future_a_placeholder = self._build_placeholder(
-            "Reserved for upcoming store metrics and workflow tools."
-        )
+        self.language_settings_panel = self._build_language_settings_panel()
         self.future_b_placeholder = self._build_placeholder(
             "Reserved for additional store-specific enhancements."
         )
@@ -314,10 +318,10 @@ class StoreAdminDashboardScreen(QWidget):
             subtitle="Current item catalog and item costs for this store.",
             content_widget=self.items_table,
         )
-        self.future_a_card = self._build_card(
-            title="Future Use",
-            subtitle="Reserved area for future enhancements.",
-            content_widget=self.future_a_placeholder,
+        self.language_settings_card = self._build_card(
+            title="Manager Screen Language",
+            subtitle="Choose the language used only on manager screens for this store.",
+            content_widget=self.language_settings_panel,
         )
         self.future_b_card = self._build_card(
             title="Future Use",
@@ -327,13 +331,14 @@ class StoreAdminDashboardScreen(QWidget):
 
         grid.addWidget(self.staff_card, 0, 0)
         grid.addWidget(self.items_card, 0, 1)
-        grid.addWidget(self.future_a_card, 1, 0)
+        grid.addWidget(self.language_settings_card, 1, 0)
         grid.addWidget(self.future_b_card, 1, 1)
 
         root.addLayout(grid)
         root.addStretch(1)
 
         self.clear_context()
+        self.save_language_button.clicked.connect(self._save_manager_language)
 
     def set_context(
         self,
@@ -358,6 +363,9 @@ class StoreAdminDashboardScreen(QWidget):
             rows=(),
             empty_message="Store items will appear here after they are created.",
         )
+        self.manager_language_combo.setCurrentIndex(0)
+        self.save_language_button.setEnabled(False)
+        self.language_feedback_label.hide()
 
     def refresh_data(self) -> None:
         if self._store_context is None:
@@ -368,6 +376,7 @@ class StoreAdminDashboardScreen(QWidget):
             actor_user_id=self._current_user_id
         )
         item_rows = self._operations_service.list_items(store_id=self._store_context.store_id)
+        self._sync_language_controls()
 
         self._set_table_rows(
             self.staff_table,
@@ -380,6 +389,81 @@ class StoreAdminDashboardScreen(QWidget):
             empty_message="Create items to populate this table.",
             numeric_columns={1},
         )
+
+    def _build_language_settings_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(10)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(8)
+
+        self.manager_language_combo = QComboBox()
+        self.manager_language_combo.setMinimumHeight(38)
+        for code, label in SUPPORTED_LANGUAGES:
+            self.manager_language_combo.addItem(label, code)
+        form.addRow(self._form_label("Language"), self.manager_language_combo)
+
+        self.save_language_button = QPushButton("Save Language")
+        self.save_language_button.setObjectName("ActionButton")
+        self.save_language_button.setMinimumHeight(40)
+
+        self.language_feedback_label = QLabel("")
+        self.language_feedback_label.setObjectName("StatusMessage")
+        self.language_feedback_label.setWordWrap(True)
+        self.language_feedback_label.hide()
+
+        layout.addLayout(form)
+        layout.addWidget(self.save_language_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.language_feedback_label)
+        layout.addStretch(1)
+        return panel
+
+    def _form_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("FormLabel")
+        return label
+
+    def _sync_language_controls(self) -> None:
+        if self._store_context is None:
+            return
+        self.manager_language_combo.blockSignals(True)
+        for index in range(self.manager_language_combo.count()):
+            if self.manager_language_combo.itemData(index) == self._store_context.manager_language_code:
+                self.manager_language_combo.setCurrentIndex(index)
+                break
+        self.manager_language_combo.blockSignals(False)
+        self.save_language_button.setEnabled(True)
+        self.language_feedback_label.hide()
+
+    def _save_manager_language(self) -> None:
+        if self._current_user_id is None:
+            return
+        language_code = self.manager_language_combo.currentData()
+        if not isinstance(language_code, str):
+            language_code = "en"
+        try:
+            self._store_context = self._user_management_service.update_manager_language_for_store_admin(
+                actor_user_id=self._current_user_id,
+                language_code=language_code,
+            )
+        except ValueError as exc:
+            self._set_language_feedback(str(exc), tone="error")
+            return
+
+        self._set_language_feedback("Manager screen language updated.", tone="success")
+        if self._on_manager_language_changed is not None:
+            self._on_manager_language_changed()
+
+    def _set_language_feedback(self, message: str, *, tone: str) -> None:
+        self.language_feedback_label.setText(message)
+        self.language_feedback_label.setProperty("tone", tone)
+        self.language_feedback_label.style().unpolish(self.language_feedback_label)
+        self.language_feedback_label.style().polish(self.language_feedback_label)
+        self.language_feedback_label.setVisible(bool(message))
 
     def _build_card(
         self,
@@ -505,7 +589,7 @@ class StaffMemberEditorDialog(QDialog):
         title = QLabel("Add Staff Member" if profile is None else "Edit Staff Member")
         title.setObjectName("SectionTitle")
         copy = QLabel(
-            "Capture the staff member profile in one screen. Only Manager and Worker roles are available in this store."
+            "Capture the staff member profile in one screen. Select one or more store staff roles."
         )
         copy.setObjectName("SectionCopy")
         copy.setWordWrap(True)
@@ -587,13 +671,22 @@ class StaffMemberEditorDialog(QDialog):
         self.joining_date_input.setCalendarPopup(True)
         self.joining_date_input.setDisplayFormat("yyyy-MM-dd")
         self.joining_date_input.setMinimumHeight(42)
-        self.role_combo = QComboBox()
-        self.role_combo.setMinimumHeight(42)
+        self.role_checks: dict[str, QCheckBox] = {}
+        roles_panel = QWidget()
+        roles_layout = QVBoxLayout(roles_panel)
+        roles_layout.setContentsMargins(0, 0, 0, 0)
+        roles_layout.setSpacing(6)
+        for role_name in role_options:
+            role_check = QCheckBox(role_name)
+            role_check.setMinimumHeight(28)
+            self.role_checks[role_name] = role_check
+            roles_layout.addWidget(role_check)
+        roles_layout.addStretch(1)
         self.created_by_input = QLineEdit()
         self.created_by_input.setReadOnly(True)
 
         assignment_form.addRow(self._form_label("Joining date"), self.joining_date_input)
-        assignment_form.addRow(self._form_label("Role"), self.role_combo)
+        assignment_form.addRow(self._form_label("Roles"), roles_panel)
         assignment_form.addRow(self._form_label("Created by"), self.created_by_input)
 
         assignment_layout.addWidget(assignment_title)
@@ -610,7 +703,6 @@ class StaffMemberEditorDialog(QDialog):
         self.cancel_button.clicked.connect(self.reject)
         self.save_button.clicked.connect(self._attempt_accept)
 
-        self.role_combo.addItems(list(role_options))
         self._populate(profile=profile, created_by_name=created_by_name)
 
     def payload(self) -> dict[str, object]:
@@ -627,7 +719,11 @@ class StaffMemberEditorDialog(QDialog):
             "contact_number": self.contact_number_input.text().strip(),
             "speciality": self.speciality_input.text().strip(),
             "joining_date": joining_date,
-            "role_name": self.role_combo.currentText().strip(),
+            "role_names": [
+                role_name
+                for role_name, checkbox in self.role_checks.items()
+                if checkbox.isChecked()
+            ],
         }
 
     def set_feedback(self, message: str, *, tone: str) -> None:
@@ -641,6 +737,8 @@ class StaffMemberEditorDialog(QDialog):
     def _populate(self, *, profile: StaffMemberProfile | None, created_by_name: str) -> None:
         self.set_feedback("", tone="success")
         default_role = self._role_options[0] if self._role_options else "Worker"
+        for checkbox in self.role_checks.values():
+            checkbox.setChecked(False)
         if profile is None:
             self.full_name_input.clear()
             self.username_input.clear()
@@ -648,7 +746,8 @@ class StaffMemberEditorDialog(QDialog):
             self.contact_number_input.clear()
             self.speciality_input.clear()
             self.joining_date_input.setDate(QDate.currentDate())
-            self.role_combo.setCurrentText(default_role)
+            if default_role in self.role_checks:
+                self.role_checks[default_role].setChecked(True)
             self.created_by_input.setText(created_by_name)
             return
 
@@ -664,7 +763,10 @@ class StaffMemberEditorDialog(QDialog):
                 profile.joining_date.day,
             )
         )
-        self.role_combo.setCurrentText(profile.role_name)
+        selected_roles = profile.roles or ((profile.role_name,) if profile.role_name else ())
+        for role_name in selected_roles:
+            if role_name in self.role_checks:
+                self.role_checks[role_name].setChecked(True)
         self.created_by_input.setText(profile.created_by_name or created_by_name)
 
     def _attempt_accept(self) -> None:
@@ -678,8 +780,8 @@ class StaffMemberEditorDialog(QDialog):
         if not payload["contact_number"]:
             self.set_feedback("Contact number is required.", tone="error")
             return
-        if not payload["role_name"]:
-            self.set_feedback("Role is required.", tone="error")
+        if not payload["role_names"]:
+            self.set_feedback("Select at least one role.", tone="error")
             return
         self.accept()
 
@@ -800,7 +902,7 @@ class StoreStaffCreateScreen(QWidget):
 
         staff_rows = self._user_management_service.list_store_staff(
             actor_user_id=self._current_user_id,
-            created_by_actor_only=True,
+            created_by_actor_only=False,
         )
         if not staff_rows:
             self.staff_table.setRowCount(1)
@@ -837,7 +939,7 @@ class StoreStaffCreateScreen(QWidget):
         return tuple(
             role_name
             for role_name in self._user_management_service.available_roles_for_actor(self._current_user_id)
-            if role_name in {"Manager", "Worker"}
+            if role_name in {"Manager", "Accountant", "Worker"}
         )
 
     def _open_add_staff_dialog(self) -> None:
@@ -864,7 +966,7 @@ class StoreStaffCreateScreen(QWidget):
                     contact_number=str(payload["contact_number"]),
                     speciality=str(payload["speciality"]),
                     joining_date=payload["joining_date"],  # type: ignore[arg-type]
-                    role_name=str(payload["role_name"]),
+                    role_names=list(payload["role_names"]),  # type: ignore[arg-type]
                 )
             except ValueError as exc:
                 dialog.set_feedback(str(exc), tone="error")
@@ -914,7 +1016,7 @@ class StoreStaffCreateScreen(QWidget):
                     contact_number=str(payload["contact_number"]),
                     speciality=str(payload["speciality"]),
                     joining_date=payload["joining_date"],  # type: ignore[arg-type]
-                    role_name=str(payload["role_name"]),
+                    role_names=list(payload["role_names"]),  # type: ignore[arg-type]
                 )
             except ValueError as exc:
                 dialog.set_feedback(str(exc), tone="error")
@@ -1012,11 +1114,14 @@ class ItemEditorDialog(QDialog):
         self.item_name_input.setPlaceholderText("Enter item name")
         self.cost_input = QLineEdit()
         self.cost_input.setPlaceholderText("0.00")
+        self.making_charges_input = QLineEdit()
+        self.making_charges_input.setPlaceholderText("0.00")
         self.store_input = QLineEdit()
         self.store_input.setReadOnly(True)
 
         details_form.addRow(self._form_label("Item name"), self.item_name_input)
         details_form.addRow(self._form_label("Cost"), self.cost_input)
+        details_form.addRow(self._form_label("Making charges"), self.making_charges_input)
         details_form.addRow(self._form_label("Store"), self.store_input)
 
         details_layout.addWidget(details_title)
@@ -1067,6 +1172,7 @@ class ItemEditorDialog(QDialog):
         return {
             "item_name": self.item_name_input.text().strip(),
             "cost_text": self.cost_input.text().strip(),
+            "making_charges_text": self.making_charges_input.text().strip(),
         }
 
     def set_feedback(self, message: str, *, tone: str) -> None:
@@ -1083,12 +1189,14 @@ class ItemEditorDialog(QDialog):
         if item_row is None:
             self.item_name_input.clear()
             self.cost_input.clear()
+            self.making_charges_input.clear()
             self.created_on_input.setText("Will be set when the item is created")
             self.updated_on_input.setText("Will be set when the item is created")
             return
 
         self.item_name_input.setText(item_row.item_name)
         self.cost_input.setText(f"{item_row.cost:.2f}")
+        self.making_charges_input.setText(f"{item_row.making_charges:.2f}")
         self.created_on_input.setText(item_row.created_on.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
         self.updated_on_input.setText(item_row.updated_on.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 
@@ -1100,13 +1208,20 @@ class ItemEditorDialog(QDialog):
         if not payload["cost_text"]:
             self.set_feedback("Cost is required.", tone="error")
             return
+        if not payload["making_charges_text"]:
+            self.set_feedback("Making charges are required.", tone="error")
+            return
         try:
             cost = Decimal(payload["cost_text"])
+            making_charges = Decimal(payload["making_charges_text"])
         except (InvalidOperation, ValueError):
-            self.set_feedback("Enter a valid numeric cost.", tone="error")
+            self.set_feedback("Enter valid numeric cost and making charges.", tone="error")
             return
         if cost < Decimal("0.00"):
             self.set_feedback("Item cost cannot be negative.", tone="error")
+            return
+        if making_charges < Decimal("0.00"):
+            self.set_feedback("Making charges cannot be negative.", tone="error")
             return
         self.accept()
 
@@ -1120,6 +1235,7 @@ class StoreItemsCreateScreen(QWidget):
     TABLE_HEADERS = (
         "Item Name",
         "Cost",
+        "Making Charges",
         "Created On",
         "Updated On",
     )
@@ -1189,6 +1305,7 @@ class StoreItemsCreateScreen(QWidget):
         self.items_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.items_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.items_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.items_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
 
         table_layout.addWidget(title)
         table_layout.addWidget(copy)
@@ -1246,6 +1363,7 @@ class StoreItemsCreateScreen(QWidget):
             row_values = (
                 item_row.item_name,
                 f"INR {item_row.cost:,.2f}",
+                f"INR {item_row.making_charges:,.2f}",
                 item_row.created_on.astimezone(timezone.utc).strftime("%Y-%m-%d"),
                 item_row.updated_on.astimezone(timezone.utc).strftime("%Y-%m-%d"),
             )
@@ -1255,7 +1373,7 @@ class StoreItemsCreateScreen(QWidget):
                 item.setData(Qt.ItemDataRole.UserRole, item_row.item_id)
                 alignment = (
                     Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-                    if column_index == 1
+                    if column_index in {1, 2}
                     else Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
                 )
                 item.setTextAlignment(alignment)
@@ -1279,6 +1397,7 @@ class StoreItemsCreateScreen(QWidget):
                     store_id=self._store_context.store_id,
                     item_name=payload["item_name"],
                     cost=Decimal(payload["cost_text"]),
+                    making_charges=Decimal(payload["making_charges_text"]),
                 )
             except ValueError as exc:
                 dialog.set_feedback(str(exc), tone="error")
@@ -1321,6 +1440,7 @@ class StoreItemsCreateScreen(QWidget):
                     item_id=item_id,
                     item_name=payload["item_name"],
                     cost=Decimal(payload["cost_text"]),
+                    making_charges=Decimal(payload["making_charges_text"]),
                 )
             except ValueError as exc:
                 dialog.set_feedback(str(exc), tone="error")
@@ -1339,6 +1459,206 @@ class StoreItemsCreateScreen(QWidget):
         self.item_feedback_label.style().unpolish(self.item_feedback_label)
         self.item_feedback_label.style().polish(self.item_feedback_label)
         self.item_feedback_label.update()
+
+
+class StorePaymentsScreen(QWidget):
+    TABLE_HEADERS = (
+        "Customer-item",
+        "Item Status",
+        "Worker Name",
+        "Making Charges",
+    )
+
+    def __init__(
+        self,
+        *,
+        user_management_service: AdminUserManagementService,
+        operations_service: OperationsService,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._user_management_service = user_management_service
+        self._operations_service = operations_service
+        self._current_user_id: str | None = None
+        self._store_context: StoreDashboardContext | None = None
+        self._workers: tuple[StoreStaffRow, ...] = ()
+        self._rows: tuple[WorkerPaymentItemRow, ...] = ()
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(14)
+
+        metrics_row = QHBoxLayout()
+        metrics_row.setContentsMargins(0, 0, 0, 0)
+        metrics_row.setSpacing(12)
+
+        self.worker_filter = QComboBox()
+        self.worker_filter.setMinimumHeight(36)
+        self.worker_filter.setMinimumWidth(190)
+        metrics_row.addWidget(self._worker_filter_metric())
+
+        self.total_items_value = QLabel("0")
+        self.ready_items_value = QLabel("0")
+        self.making_charges_value = QLabel("INR 0.00")
+        metrics_row.addWidget(self._metric_card("TOTAL ITEMS", self.total_items_value))
+        metrics_row.addWidget(self._metric_card("READY ITEMS", self.ready_items_value))
+        metrics_row.addWidget(self._metric_card("MAKING CHARGES", self.making_charges_value))
+
+        content_row = QHBoxLayout()
+        content_row.setContentsMargins(0, 0, 0, 0)
+        content_row.setSpacing(16)
+
+        left_section = QWidget()
+        left_layout = QVBoxLayout(left_section)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
+
+        right_section = QWidget()
+        right_section.setObjectName("PaymentsDetailSection")
+        right_layout = QVBoxLayout(right_section)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+        right_layout.addStretch(1)
+
+        self.payments_table = QTableWidget(0, len(self.TABLE_HEADERS))
+        self.payments_table.setObjectName("PaymentsFlatTable")
+        self.payments_table.setHorizontalHeaderLabels(list(self.TABLE_HEADERS))
+        self.payments_table.setAlternatingRowColors(True)
+        self.payments_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.payments_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.payments_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.payments_table.setShowGrid(False)
+        self.payments_table.verticalHeader().setVisible(False)
+        self.payments_table.verticalHeader().setDefaultSectionSize(32)
+        self.payments_table.horizontalHeader().setStretchLastSection(False)
+        self.payments_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.payments_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.payments_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.payments_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        left_layout.addWidget(self.payments_table, stretch=1)
+        content_row.addWidget(left_section, stretch=6)
+        content_row.addWidget(right_section, stretch=4)
+
+        root.addLayout(metrics_row)
+        root.addLayout(content_row, stretch=1)
+
+        self.worker_filter.currentIndexChanged.connect(lambda _index=0: self.refresh_data())
+        self.clear_context()
+
+    def set_context(
+        self,
+        *,
+        current_user_id: str | None,
+        store_context: StoreDashboardContext,
+    ) -> None:
+        self._current_user_id = current_user_id
+        self._store_context = store_context
+        self.refresh_data()
+
+    def clear_context(self) -> None:
+        self._current_user_id = None
+        self._store_context = None
+        self._workers = ()
+        self._rows = ()
+        self._set_worker_filter()
+        self._set_metrics(())
+        self._set_table_rows(())
+
+    def refresh_data(self) -> None:
+        if self._store_context is None:
+            self.clear_context()
+            return
+        selected_worker_id = self.worker_filter.currentData()
+        worker_id = selected_worker_id if isinstance(selected_worker_id, str) else ""
+        self._workers = self._user_management_service.list_store_workers(
+            store_id=self._store_context.store_id
+        )
+        self._set_worker_filter(selected_worker_id=worker_id)
+        self._rows = self._operations_service.list_worker_payment_items_for_store(
+            store_id=self._store_context.store_id,
+            worker_id=worker_id,
+        )
+        self._set_metrics(self._rows)
+        self._set_table_rows(self._rows)
+
+    def _set_worker_filter(self, *, selected_worker_id: str = "") -> None:
+        self.worker_filter.blockSignals(True)
+        self.worker_filter.clear()
+        self.worker_filter.addItem("All Workers", "")
+        for worker in self._workers:
+            self.worker_filter.addItem(worker.full_name, worker.user_id)
+        for index in range(self.worker_filter.count()):
+            if self.worker_filter.itemData(index) == selected_worker_id:
+                self.worker_filter.setCurrentIndex(index)
+                break
+        self.worker_filter.blockSignals(False)
+
+    def _set_metrics(self, rows: tuple[WorkerPaymentItemRow, ...]) -> None:
+        self.total_items_value.setText(str(len(rows)))
+        self.ready_items_value.setText(str(sum(1 for row in rows if row.item_status == "READY")))
+        self.making_charges_value.setText(
+            f"INR {sum((row.making_charges for row in rows), Decimal('0.00')):,.2f}"
+        )
+
+    def _set_table_rows(self, rows: tuple[WorkerPaymentItemRow, ...]) -> None:
+        self.payments_table.clearSpans()
+        self.payments_table.clearContents()
+        if not rows:
+            self.payments_table.setRowCount(1)
+            self.payments_table.setSpan(0, 0, 1, self.payments_table.columnCount())
+            empty_item = QTableWidgetItem("No payment items available for the selected worker.")
+            empty_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.payments_table.setItem(0, 0, empty_item)
+            for column_index in range(1, self.payments_table.columnCount()):
+                self.payments_table.setItem(0, column_index, QTableWidgetItem(""))
+            return
+
+        self.payments_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            values = (
+                f"{row.customer_name}/{row.item_name}",
+                row.item_status,
+                row.worker_name,
+                f"INR {row.making_charges:,.2f}",
+            )
+            for column_index, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                alignment = (
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    if column_index == 3
+                    else Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                )
+                item.setTextAlignment(alignment)
+                self.payments_table.setItem(row_index, column_index, item)
+
+    def _worker_filter_metric(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("MetricCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 12, 18, 12)
+        layout.setSpacing(6)
+        layout.addWidget(self.worker_filter)
+        label = QLabel("WORKER")
+        label.setObjectName("MetricTitle")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(label)
+        return card
+
+    def _metric_card(self, title: str, value_label: QLabel) -> QFrame:
+        card = QFrame()
+        card.setObjectName("MetricCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 12, 18, 12)
+        layout.setSpacing(6)
+        value_label.setObjectName("MetricValue")
+        value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_label = QLabel(title)
+        title_label.setObjectName("MetricTitle")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(value_label)
+        layout.addWidget(title_label)
+        return card
 
 
 class MainWindow(QMainWindow):
@@ -1404,6 +1724,10 @@ class MainWindow(QMainWindow):
 
         self._apply_styles()
         self._reset_workspace_state()
+        install_action_logging(self, screen="MainWindow", context=self._log_context)
+
+    def _is_development_mode(self) -> bool:
+        return self._app_env.lower() == "development"
 
     def _build_login_page(self) -> QWidget:
         page = QWidget(self)
@@ -1522,6 +1846,17 @@ class MainWindow(QMainWindow):
         form.addRow(identifier_label, self.identifier_input)
         form.addRow(password_label, self.password_input)
 
+        self.dev_account_combo = QComboBox()
+        self.dev_account_combo.setObjectName("DevAccountSelect")
+        self.dev_account_combo.currentIndexChanged.connect(self._fill_development_credentials)
+        if self._is_development_mode():
+            dev_account_label = QLabel("Development User")
+            dev_account_label.setObjectName("FormLabel")
+            self._populate_development_accounts()
+            form.addRow(dev_account_label, self.dev_account_combo)
+        else:
+            self.dev_account_combo.hide()
+
         self.validation_label = QLabel("")
         self.validation_label.setObjectName("StatusMessage")
         self.validation_label.setWordWrap(True)
@@ -1557,6 +1892,37 @@ class MainWindow(QMainWindow):
         layout.addWidget(splash_panel, 7)
         layout.addLayout(card_column, 5)
         return page
+
+    def _populate_development_accounts(self) -> None:
+        self.dev_account_combo.blockSignals(True)
+        self.dev_account_combo.clear()
+        self.dev_account_combo.addItem("Select test user", None)
+        for user in self._admin_user_management_service.list_users():
+            profile = self._admin_user_management_service.get_user_profile(user.user_id)
+            if profile is None:
+                continue
+            username = profile.username.strip()
+            if not username:
+                continue
+            password = self._admin_user_management_service.default_password_for_username(username)
+            role_label = ", ".join(profile.roles) if profile.roles else "User"
+            self.dev_account_combo.addItem(
+                f"{profile.full_name} ({username}) - {role_label}",
+                (username, password),
+            )
+        self.dev_account_combo.blockSignals(False)
+
+    def _fill_development_credentials(self, _index: int = 0) -> None:
+        if not self._is_development_mode():
+            return
+        credentials = self.dev_account_combo.currentData()
+        if not isinstance(credentials, tuple) or len(credentials) != 2:
+            return
+        username, password = credentials
+        if not isinstance(username, str) or not isinstance(password, str):
+            return
+        self.identifier_input.setText(username)
+        self.password_input.setText(password)
 
     def _build_forgot_password_page(self) -> QWidget:
         page = QWidget(self)
@@ -1913,7 +2279,7 @@ class MainWindow(QMainWindow):
         self.nav_create_items_button = QPushButton("Create Items")
         self.nav_orders_management_button = QPushButton("Orders Assignment")
         self.nav_work_management_button = QPushButton("Work Management")
-        self.nav_billing_button = QPushButton("Billing")
+        self.nav_billing_button = QPushButton("Payments")
         self.logout_button = QPushButton("Sign out")
         self.logout_button.setObjectName("SecondaryButton")
         self.logout_button.clicked.connect(self._logout)
@@ -2030,8 +2396,8 @@ class MainWindow(QMainWindow):
                 "widget": self.work_management_page,
             },
             "billing": {
-                "title": "Billing",
-                "subtitle": "Billing screens render inside the shell and inherit the current session context.",
+                "title": "Payments",
+                "subtitle": "Worker payment management will render here.",
                 "widget": self.billing_page,
             },
         }
@@ -2065,6 +2431,7 @@ class MainWindow(QMainWindow):
         self.store_home_page = StoreAdminDashboardScreen(
             user_management_service=self._admin_user_management_service,
             operations_service=self._operations_service,
+            on_manager_language_changed=self._handle_manager_language_changed,
             parent=self,
         )
 
@@ -2159,40 +2526,14 @@ class MainWindow(QMainWindow):
         return page
 
     def _build_billing_page(self) -> QWidget:
-        page = QWidget(self)
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
-
-        billing_card = QFrame()
-        billing_card.setObjectName("InnerCard")
-        billing_layout = QVBoxLayout(billing_card)
-        billing_layout.setContentsMargins(20, 20, 20, 20)
-        billing_layout.setSpacing(10)
-
-        billing_title = QLabel("Billing Workspace")
-        billing_title.setObjectName("SectionTitle")
-        billing_copy = QLabel(
-            "This route is rendered inside the shared application shell so future billing flows can reuse the current session state and route header."
+        return StorePaymentsScreen(
+            user_management_service=self._admin_user_management_service,
+            operations_service=self._operations_service,
+            parent=self,
         )
-        billing_copy.setObjectName("SectionCopy")
-        billing_copy.setWordWrap(True)
-
-        billing_note = QLabel(
-            "Use this page as the in-app destination for invoices, collections, or reconciliation tools."
-        )
-        billing_note.setObjectName("SectionCopy")
-        billing_note.setWordWrap(True)
-
-        billing_layout.addWidget(billing_title)
-        billing_layout.addWidget(billing_copy)
-        billing_layout.addWidget(billing_note)
-
-        layout.addWidget(billing_card)
-        layout.addStretch(1)
-        return page
 
     def _attempt_login(self) -> None:
+        log_ui_action("MainWindow", "attempt_login", **self._log_context())
         if self._is_loading:
             return
 
@@ -2305,6 +2646,7 @@ class MainWindow(QMainWindow):
         self.new_password_input.setFocus()
 
     def _submit_password_reset(self) -> None:
+        log_ui_action("MainWindow", "submit_password_reset", **self._log_context())
         if self._pending_password_reset is None:
             return
 
@@ -2408,6 +2750,8 @@ class MainWindow(QMainWindow):
         context = self._authorization_service.build_context(self._current_user_id)
         store_scoped_mode = self._is_store_scoped_workspace_mode()
         store_admin_mode = self._is_store_admin_mode()
+        store_manager_mode = self._is_store_manager_mode()
+        accountant_mode = self._has_role("Accountant")
 
         if store_scoped_mode:
             route_permissions = {
@@ -2418,15 +2762,18 @@ class MainWindow(QMainWindow):
                     self._current_user_id
                 ),
                 "create_items": store_admin_mode,
-                "orders_management": self._is_store_manager_mode(),
-                "work_management": self._is_store_manager_mode(),
-                "billing": False,
+                "orders_management": store_manager_mode,
+                "work_management": store_manager_mode,
+                "billing": accountant_mode
+                and self._authorization_guard.can(permission="worker:payment:view", context=context),
             }
-            visible_routes = (
-                {"home", "orders_management", "work_management"}
-                if self._is_store_manager_mode()
-                else {"home", "admin", "create_staff", "create_items"}
-            )
+            visible_routes = {"home"}
+            if store_manager_mode:
+                visible_routes.update({"orders_management", "work_management"})
+            if accountant_mode:
+                visible_routes.add("billing")
+            if store_admin_mode:
+                visible_routes.update({"admin", "create_staff", "create_items"})
         else:
             route_permissions = {
                 "home": self._authorization_guard.can(permission="nav:home", context=context),
@@ -2452,6 +2799,8 @@ class MainWindow(QMainWindow):
                 tooltip_key = "orders assignment"
             elif route_key == "work_management":
                 tooltip_key = "work management"
+            elif route_key == "billing":
+                tooltip_key = "payments"
             else:
                 tooltip_key = route_key
             button.setToolTip("" if is_allowed else f"Access denied for {tooltip_key}.")
@@ -2470,7 +2819,7 @@ class MainWindow(QMainWindow):
         ):
             return "admin"
         route_order = (
-            ("home", "orders_management", "work_management", "admin", "create_staff", "create_items")
+            ("home", "orders_management", "work_management", "billing", "admin", "create_staff", "create_items")
             if self._is_store_scoped_workspace_mode()
             else ("home", "admin", "billing")
         )
@@ -2480,6 +2829,7 @@ class MainWindow(QMainWindow):
         return "home"
 
     def _navigate(self, route_key: str, *, clear_notice: bool = True) -> None:
+        log_ui_action("MainWindow", "navigate", target_route=route_key, **self._log_context())
         if self._session_state is None or route_key not in self._route_config:
             return
 
@@ -2493,6 +2843,8 @@ class MainWindow(QMainWindow):
             self.orders_management_page.refresh_data()
         elif route_key == "work_management":
             self.work_management_page.refresh_data()
+        elif route_key == "billing" and isinstance(self.billing_page, StorePaymentsScreen):
+            self.billing_page.refresh_data()
         self.route_stack.setCurrentWidget(route["widget"])
         self.page_title_label.setText(route["title"])
         hide_route_heading = route_key in {"orders_management", "work_management"}
@@ -2511,6 +2863,7 @@ class MainWindow(QMainWindow):
         self._update_workspace_chrome_visibility()
 
     def _run_operational_report(self) -> None:
+        log_ui_action("MainWindow", "run_operational_report", **self._log_context())
         if self._current_user_id is None:
             return
 
@@ -2525,6 +2878,7 @@ class MainWindow(QMainWindow):
         self._set_status_label(self.workspace_notice, report_status, tone="success")
 
     def _logout(self) -> None:
+        log_ui_action("MainWindow", "logout", **self._log_context())
         self._current_user_id = None
         self._session_state = None
         self._pending_password_reset = None
@@ -2534,6 +2888,8 @@ class MainWindow(QMainWindow):
         self.create_items_page.set_current_user_id(None)
         self.orders_management_page.clear_context()
         self.work_management_page.clear_context()
+        if isinstance(self.billing_page, StorePaymentsScreen):
+            self.billing_page.clear_context()
         self.identifier_input.clear()
         self.password_input.clear()
         self.recovery_identifier_input.clear()
@@ -2570,6 +2926,8 @@ class MainWindow(QMainWindow):
         self.store_manager_home_page.clear_context()
         self.orders_management_page.clear_context()
         self.work_management_page.clear_context()
+        if isinstance(self.billing_page, StorePaymentsScreen):
+            self.billing_page.clear_context()
         self.home_mode_stack.setCurrentWidget(self.default_home_page)
         self.create_staff_page.set_current_user_id(None)
         self.create_items_page.set_current_user_id(None)
@@ -2598,6 +2956,7 @@ class MainWindow(QMainWindow):
         self._update_workspace_chrome_visibility()
 
     def _reload_admin_ui(self) -> None:
+        log_ui_action("MainWindow", "reload_admin_ui", **self._log_context())
         if self._app_env.lower() != "development" or self._session_state is None:
             return
 
@@ -2698,6 +3057,9 @@ class MainWindow(QMainWindow):
         self.nav_create_items_button.setText("Create Items")
         self.nav_orders_management_button.setText("Orders Assignment")
         self.nav_work_management_button.setText("Work Management")
+        self.nav_billing_button.setText("Payments")
+        self._route_config["billing"]["title"] = "Payments"
+        self._route_config["billing"]["subtitle"] = ""
         self._refresh_home_route_content()
 
     def _refresh_store_scoped_shell(self, *, identifier: str, expiry: str) -> None:
@@ -2772,6 +3134,14 @@ class MainWindow(QMainWindow):
         if self._is_store_admin_mode() and self._store_dashboard_context is not None:
             self.orders_management_page.clear_context()
             self.work_management_page.clear_context()
+            if isinstance(self.billing_page, StorePaymentsScreen):
+                if self._has_role("Accountant"):
+                    self.billing_page.set_context(
+                        current_user_id=self._current_user_id,
+                        store_context=self._store_dashboard_context,
+                    )
+                else:
+                    self.billing_page.clear_context()
             self.store_home_page.set_context(
                 current_user_id=self._current_user_id,
                 store_context=self._store_dashboard_context,
@@ -2793,6 +3163,14 @@ class MainWindow(QMainWindow):
                 current_user_id=self._current_user_id,
                 store_context=self._store_dashboard_context,
             )
+            if isinstance(self.billing_page, StorePaymentsScreen):
+                if self._has_role("Accountant"):
+                    self.billing_page.set_context(
+                        current_user_id=self._current_user_id,
+                        store_context=self._store_dashboard_context,
+                    )
+                else:
+                    self.billing_page.clear_context()
             self.home_mode_stack.setCurrentWidget(self.store_manager_home_page)
             return
 
@@ -2800,12 +3178,28 @@ class MainWindow(QMainWindow):
             self.store_home_page.clear_context()
             self.orders_management_page.clear_context()
             self.work_management_page.clear_context()
+            if isinstance(self.billing_page, StorePaymentsScreen):
+                self.billing_page.clear_context()
             self.home_mode_stack.setCurrentWidget(self.store_worker_home_page)
+            return
+
+        if self._has_role("Accountant") and self._store_dashboard_context is not None:
+            self.store_home_page.clear_context()
+            self.orders_management_page.clear_context()
+            self.work_management_page.clear_context()
+            if isinstance(self.billing_page, StorePaymentsScreen):
+                self.billing_page.set_context(
+                    current_user_id=self._current_user_id,
+                    store_context=self._store_dashboard_context,
+                )
+            self.home_mode_stack.setCurrentWidget(self.default_home_page)
             return
 
         self.store_home_page.clear_context()
         self.orders_management_page.clear_context()
         self.work_management_page.clear_context()
+        if isinstance(self.billing_page, StorePaymentsScreen):
+            self.billing_page.clear_context()
         self.home_mode_stack.setCurrentWidget(self.default_home_page)
 
     def _refresh_store_admin_views(self) -> None:
@@ -2837,12 +3231,21 @@ class MainWindow(QMainWindow):
             return
         self._refresh_store_admin_shell()
 
+    def _handle_manager_language_changed(self) -> None:
+        if self._current_user_id is None or self._session_state is None:
+            return
+        self._refresh_store_admin_shell()
+        self.store_manager_home_page.refresh_language()
+        self.orders_management_page.refresh_language()
+        self.work_management_page.refresh_language()
+
     def _update_workspace_chrome_visibility(self) -> None:
         store_scoped_mode = self._is_store_scoped_workspace_mode()
         store_dashboard_mode = store_scoped_mode and self._active_route == "home"
         full_content_mode = store_scoped_mode and self._active_route in {
             "orders_management",
             "work_management",
+            "billing",
         }
 
         self.workspace_eyebrow.setVisible(not store_scoped_mode)
@@ -2879,12 +3282,30 @@ class MainWindow(QMainWindow):
             and self._admin_user_management_service.role_name_for_user(self._current_user_id) == "Worker"
         )
 
+    def _has_role(self, role_name: str) -> bool:
+        if self._current_user_id is None:
+            return False
+        profile = self._admin_user_management_service.get_user_profile(self._current_user_id)
+        return profile is not None and role_name in profile.roles
+
     def _is_store_scoped_workspace_mode(self) -> bool:
         return (
             self._is_store_admin_mode()
             or self._is_store_manager_mode()
+            or self._has_role("Accountant")
             or self._is_store_worker_mode()
         )
+
+    def _log_context(self) -> dict[str, object]:
+        return {
+            "user_id": self._current_user_id or "",
+            "route": self._active_route,
+            "store_id": (
+                self._store_dashboard_context.store_id
+                if self._store_dashboard_context is not None
+                else ""
+            ),
+        }
 
     def _set_loading(self, is_loading: bool) -> None:
         self._is_loading = is_loading
@@ -2903,6 +3324,7 @@ class MainWindow(QMainWindow):
         label.update()
 
     def _open_forgot_password_page(self) -> None:
+        log_ui_action("MainWindow", "open_forgot_password_page", **self._log_context())
         self._pending_password_reset = None
         self.password_input.clear()
         self.recovery_identifier_input.setText(self.identifier_input.text().strip())
@@ -2917,12 +3339,14 @@ class MainWindow(QMainWindow):
             self.recovery_identifier_input.setFocus()
 
     def _return_to_login_from_recovery(self) -> None:
+        log_ui_action("MainWindow", "return_to_login_from_recovery", **self._log_context())
         identifier = self.recovery_identifier_input.text().strip()
         self._pending_password_reset = None
         self._set_status_label(self.recovery_status_label, "", tone="success")
         self._return_to_login(identifier=identifier)
 
     def _verify_password_recovery(self) -> None:
+        log_ui_action("MainWindow", "verify_password_recovery", **self._log_context())
         identifier = self.recovery_identifier_input.text().strip()
         recovery_contact = self.recovery_contact_input.text().strip()
         if not identifier or not recovery_contact:
@@ -2954,6 +3378,7 @@ class MainWindow(QMainWindow):
         )
 
     def _cancel_password_reset(self) -> None:
+        log_ui_action("MainWindow", "cancel_password_reset", **self._log_context())
         if self._pending_password_reset is None:
             self._return_to_login()
             return
@@ -2975,6 +3400,7 @@ class MainWindow(QMainWindow):
         message: str = "",
         tone: str = "success",
     ) -> None:
+        log_ui_action("MainWindow", "return_to_login", **self._log_context())
         self.identifier_input.setText(identifier)
         self.password_input.clear()
         self._set_status_label(self.validation_label, message, tone=tone)
@@ -3048,6 +3474,21 @@ class MainWindow(QMainWindow):
                 border: 1px solid #dccdbd;
                 border-radius: 18px;
             }
+            QFrame#MetricCard {
+                background-color: #fcf9f5;
+                border: 1px solid #ded2c3;
+                border-radius: 14px;
+            }
+            QLabel#MetricValue {
+                color: #111827;
+                font-size: 16px;
+                font-weight: 800;
+            }
+            QLabel#MetricTitle {
+                color: #6b5b4a;
+                font-size: 11px;
+                font-weight: 700;
+            }
             QFrame#DashboardListRow {
                 background-color: #fcf9f5;
                 border: 1px solid #ded2c3;
@@ -3081,6 +3522,42 @@ class MainWindow(QMainWindow):
                 text-align: left;
             }
             QTableWidget#DashboardTable QTableCornerButton::section {
+                background-color: #e8ddd0;
+                border: none;
+                border-bottom: 1px solid #d6c6b5;
+            }
+            QTableWidget#PaymentsFlatTable {
+                background-color: transparent;
+                alternate-background-color: #f8f2eb;
+                border: none;
+                border-radius: 0px;
+                color: #1f2933;
+                gridline-color: #eadfd2;
+                outline: none;
+            }
+            QTableWidget#PaymentsFlatTable::viewport {
+                background-color: transparent;
+                border: none;
+            }
+            QTableWidget#PaymentsFlatTable::item {
+                padding: 8px 12px;
+                border-bottom: 1px solid #eadfd2;
+            }
+            QTableWidget#PaymentsFlatTable::item:selected {
+                background-color: #ddebe8;
+                color: #1f2933;
+            }
+            QTableWidget#PaymentsFlatTable QHeaderView::section {
+                background-color: #e8ddd0;
+                color: #3d3025;
+                border: none;
+                border-bottom: 1px solid #d6c6b5;
+                padding: 10px 12px;
+                font-size: 12px;
+                font-weight: 700;
+                text-align: left;
+            }
+            QTableWidget#PaymentsFlatTable QTableCornerButton::section {
                 background-color: #e8ddd0;
                 border: none;
                 border-bottom: 1px solid #d6c6b5;

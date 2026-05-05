@@ -31,6 +31,12 @@ from PySide6.QtWidgets import (
 )
 
 from app.admin.services import AdminUserManagementService, StoreDashboardContext
+from app.desktop_shell.ui.action_logging import (
+    attach_action_logging,
+    install_action_logging,
+    log_ui_action,
+)
+from app.desktop_shell.i18n import apply_widget_translations, tr, translate_table_headers
 from app.operations.services import (
     CustomerOrderHistoryRow,
     CustomerOrderCreateInput,
@@ -125,9 +131,11 @@ class CustomerOrderEntryDialog(QDialog):
         created_by_name: str,
         customer: CustomerRow | None = None,
         measurement_rows: tuple[MeasurementRow, ...] = (),
+        language_code: str = "en",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self._language_code = language_code
         self._item_lookup = {row.item_id: row for row in item_rows}
         self._existing_customer = customer
         self._measurement_rows = measurement_rows
@@ -141,7 +149,7 @@ class CustomerOrderEntryDialog(QDialog):
             lambda: self.set_feedback("", tone="success")
         )
         self.setModal(True)
-        self.setWindowTitle("Add New Order" if customer is not None else "Add New Customer")
+        self.setWindowTitle(tr("Add New Order" if customer is not None else "Add New Customer", language_code))
         self.setMinimumSize(960, 620)
         self.resize(1040, 660)
         self._apply_dialog_styles()
@@ -251,13 +259,20 @@ class CustomerOrderEntryDialog(QDialog):
         self.priority_combo = QComboBox()
         self.priority_combo.addItems(("High", "Medium", "Low"))
         self.priority_combo.setCurrentText("Medium")
+        self.weight_input = QLineEdit()
+        self.weight_input.setPlaceholderText("Customer weight")
+        initial_weight = self._measurement_weight()
+        if initial_weight is not None:
+            self.weight_input.setText(f"{initial_weight:,.2f}")
         self._dialog_control(
             self.due_date_input,
             self.priority_combo,
+            self.weight_input,
         )
 
         metadata_form.addWidget(self._field_block("Due Date *", self.due_date_input), 0, 0)
         metadata_form.addWidget(self._field_block("Priority *", self.priority_combo), 0, 1)
+        metadata_form.addWidget(self._field_block("Weight", self.weight_input), 1, 0, 1, 2)
         metadata_layout.addWidget(metadata_title)
         metadata_layout.addLayout(metadata_form)
 
@@ -393,6 +408,9 @@ class CustomerOrderEntryDialog(QDialog):
         self._refresh_measurement_options()
         self._refresh_items_table()
         self._update_bill_amount()
+        apply_widget_translations(self, language_code)
+        translate_table_headers(self.items_table, self.ITEM_HEADERS, language_code)
+        install_action_logging(self, screen=self.__class__.__name__)
 
     def payload(self) -> dict[str, object]:
         due_date = self.due_date_input.date().toPython()
@@ -421,6 +439,7 @@ class CustomerOrderEntryDialog(QDialog):
             "due_on": due_on,
             "priority": self.priority_combo.currentText().strip(),
             "order_status": "NEW",
+            "weight": self._parse_weight(self.weight_input.text()),
             "bill_amount": self._bill_amount(),
             "paid_amount": self._parse_paid_amount(self.paid_amount_input.text()),
             "items": items,
@@ -438,6 +457,12 @@ class CustomerOrderEntryDialog(QDialog):
             self._feedback_clear_timer.start(30_000)
 
     def _attempt_accept(self) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "save_order_dialog",
+            item_count=len(self._draft_items),
+            existing_customer=bool(self._existing_customer),
+        )
         if self._existing_customer is None and not self.full_name_input.text().strip():
             self.set_feedback("Full name is required.", tone="error")
             return
@@ -455,12 +480,18 @@ class CustomerOrderEntryDialog(QDialog):
         except ValueError as exc:
             self.set_feedback(str(exc), tone="error")
             return
+        try:
+            self._parse_weight(self.weight_input.text())
+        except ValueError as exc:
+            self.set_feedback(str(exc), tone="error")
+            return
         if paid_amount > self._bill_amount():
             self.set_feedback("Paid amount cannot be greater than bill amount.", tone="error")
             return
         self.accept()
 
     def _add_item(self) -> None:
+        log_ui_action(self.__class__.__name__, "add_order_item")
         item_row = self._selected_item_row()
         if item_row is None:
             self.set_feedback("Select an item before adding it.", tone="error")
@@ -488,6 +519,7 @@ class CustomerOrderEntryDialog(QDialog):
         self.set_feedback("Item added to the order.", tone="success")
 
     def _reset_item_entry(self) -> None:
+        log_ui_action(self.__class__.__name__, "reset_order_item_entry")
         self.quantity_input.setValue(1)
         self.item_combo.setCurrentIndex(0)
         if isinstance(self.measurements_input, QLineEdit):
@@ -496,6 +528,7 @@ class CustomerOrderEntryDialog(QDialog):
         self._refresh_measurement_options()
 
     def _remove_selected_item(self) -> None:
+        log_ui_action(self.__class__.__name__, "remove_selected_order_item")
         current_row = self.items_table.currentRow()
         if current_row < 0 or current_row >= len(self._draft_items):
             self.set_feedback("Select an item row before removing it.", tone="error")
@@ -614,6 +647,24 @@ class CustomerOrderEntryDialog(QDialog):
         if parsed < Decimal("0.00"):
             raise ValueError("Paid amount cannot be negative.")
         return parsed.quantize(Decimal("0.01"))
+
+    def _parse_weight(self, value: str) -> Decimal | None:
+        normalized_value = value.strip().replace(",", "")
+        if not normalized_value:
+            return None
+        try:
+            parsed = Decimal(normalized_value)
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("Enter a valid customer weight.") from exc
+        if parsed < Decimal("0.00"):
+            raise ValueError("Customer weight cannot be negative.")
+        return parsed.quantize(Decimal("0.01"))
+
+    def _measurement_weight(self) -> Decimal | None:
+        for row in self._measurement_rows:
+            if row.weight is not None:
+                return row.weight
+        return None
 
     def _compact(self, *widgets: QWidget) -> None:
         for widget in widgets:
@@ -905,6 +956,7 @@ class CustomerDetailsDialog(QDialog):
     MEASUREMENT_HEADERS = (
         "Item",
         "Measurements",
+        "Weight",
         "Measurement Date",
     )
 
@@ -918,9 +970,11 @@ class CustomerDetailsDialog(QDialog):
         operations_service: OperationsService,
         store_id: str,
         created_by_name: str,
+        language_code: str = "en",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self._language_code = language_code
         self._customer = customer
         self._order_history = order_history
         self._payment_history = payment_history
@@ -1101,6 +1155,7 @@ class CustomerDetailsDialog(QDialog):
         self.measurements_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.measurements_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.measurements_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.measurements_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         _apply_compact_table_style(self.measurements_table, row_height=24)
         self.measurements_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._set_measurement_rows()
@@ -1140,6 +1195,11 @@ class CustomerDetailsDialog(QDialog):
         self.delivered_button.clicked.connect(self._mark_delivered)
         self.save_measurements_button.clicked.connect(self._save_measurements)
         self._refresh_latest_order_summary()
+        apply_widget_translations(self, language_code)
+        translate_table_headers(self.orders_table, self.ORDER_HEADERS, language_code)
+        translate_table_headers(self.payments_table, self.PAYMENT_HEADERS, language_code)
+        translate_table_headers(self.measurements_table, self.MEASUREMENT_HEADERS, language_code)
+        install_action_logging(self, screen=self.__class__.__name__)
 
     def _summary_metric(self, value: str, label: str) -> QWidget:
         wrapper = QWidget()
@@ -1182,7 +1242,7 @@ class CustomerDetailsDialog(QDialog):
                     "order_id": row.order_id,
                     "order_date": row.order_date,
                     "due_date": row.due_date,
-                    "total_items": 0,
+                    "total_items": row.order_quantity,
                     "paid_amount": row.paid_amount,
                     "amount": row.order_total,
                     "balance_amount": max(Decimal("0.00"), row.order_total - row.paid_amount),
@@ -1190,10 +1250,15 @@ class CustomerDetailsDialog(QDialog):
                     "status": row.order_status,
                 },
             )
-            summary["total_items"] = int(summary["total_items"]) + row.quantity
         return tuple(summaries.values())
 
     def _show_detail_tab(self, index: int) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "show_detail_tab",
+            tab_index=index,
+            customer_id=self._customer.customer_id,
+        )
         self.content_stack.setCurrentIndex(index)
         self.orders_tab_button.setChecked(index == 0)
         self.measurements_tab_button.setChecked(index == 1)
@@ -1287,12 +1352,13 @@ class CustomerDetailsDialog(QDialog):
             values = (
                 row.item_name,
                 row.measurements,
+                self._format_weight(row.weight),
                 self._format_date(row.measurement_date),
             )
             for column_index, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-                if column_index == 1:
+                if column_index in {1, 2}:
                     flags |= Qt.ItemFlag.ItemIsEditable
                 item.setFlags(flags)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -1304,6 +1370,12 @@ class CustomerDetailsDialog(QDialog):
         self._select_order(str(self._order_summaries[row]["order_id"]))
 
     def _select_order(self, order_id: str) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "select_order",
+            order_id=order_id,
+            customer_id=self._customer.customer_id,
+        )
         self._selected_order_id = order_id
         for row_index, row in enumerate(self._order_summaries):
             if row_index < len(self._order_radio_buttons):
@@ -1420,6 +1492,12 @@ class CustomerDetailsDialog(QDialog):
         return card
 
     def _mark_payment(self) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "mark_payment",
+            order_id=self._selected_order_id or "",
+            customer_id=self._customer.customer_id,
+        )
         if not self._selected_order_id:
             self._set_payment_feedback("Select an order before marking payment.", tone="error")
             return
@@ -1454,6 +1532,12 @@ class CustomerDetailsDialog(QDialog):
         self._reload_customer_detail_data()
 
     def _mark_delivered(self) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "mark_delivered",
+            order_id=self._selected_order_id or "",
+            customer_id=self._customer.customer_id,
+        )
         if not self._selected_order_id:
             self._set_payment_feedback("Select an order before marking delivery.", tone="error")
             return
@@ -1470,6 +1554,11 @@ class CustomerDetailsDialog(QDialog):
         self._reload_customer_detail_data()
 
     def _open_new_order_dialog(self) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "open_new_order_dialog",
+            customer_id=self._customer.customer_id,
+        )
         item_rows = self._operations_service.list_items(store_id=self._store_id)
         if not item_rows:
             self._set_payment_feedback("Create store items before creating an order.", tone="error")
@@ -1479,6 +1568,7 @@ class CustomerDetailsDialog(QDialog):
             created_by_name=self._created_by_name,
             customer=self._customer,
             measurement_rows=self._measurement_rows,
+            language_code=self._language_code,
             parent=self,
         )
         while dialog.exec() == QDialog.DialogCode.Accepted:
@@ -1499,6 +1589,7 @@ class CustomerDetailsDialog(QDialog):
                         status=str(payload["order_status"]),
                         paid_amount=payload["paid_amount"],  # type: ignore[arg-type]
                         items=order_items,
+                        weight=payload["weight"],  # type: ignore[arg-type]
                     ),
                 )
             except ValueError as exc:
@@ -1515,20 +1606,30 @@ class CustomerDetailsDialog(QDialog):
         return " + ".join(item.item_name for item in items[:3])
 
     def _save_measurements(self) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "save_measurements",
+            customer_id=self._customer.customer_id,
+            measurement_count=len(self._measurement_rows),
+        )
         if not self._measurement_rows:
             return
         try:
             for row_index, measurement in enumerate(self._measurement_rows):
-                item = self.measurements_table.item(row_index, 1)
-                if item is None:
+                measurement_item = self.measurements_table.item(row_index, 1)
+                if measurement_item is None:
                     continue
+                weight_item = self.measurements_table.item(row_index, 2)
                 self._operations_service.save_measurement_for_store(
                     store_id=self._store_id,
                     customer_id=self._customer.customer_id,
                     item_id=measurement.item_id,
                     item_name=measurement.item_name,
-                    measurements=item.text(),
+                    measurements=measurement_item.text(),
                     measurement_id=measurement.measurement_id,
+                    weight=self._parse_optional_weight(
+                        weight_item.text() if weight_item is not None else ""
+                    ),
                 )
         except ValueError as exc:
             self._set_payment_feedback(str(exc), tone="error")
@@ -1631,6 +1732,23 @@ class CustomerDetailsDialog(QDialog):
 
     def _format_currency(self, value: Decimal) -> str:
         return f"INR {value:,.2f}"
+
+    def _format_weight(self, value: Decimal | None) -> str:
+        if value is None:
+            return ""
+        return f"{value:,.2f}"
+
+    def _parse_optional_weight(self, value: str) -> Decimal | None:
+        normalized_value = value.strip().replace(",", "")
+        if not normalized_value or normalized_value == "--":
+            return None
+        try:
+            parsed = Decimal(normalized_value)
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("Enter a valid customer weight.") from exc
+        if parsed < Decimal("0.00"):
+            raise ValueError("Customer weight cannot be negative.")
+        return parsed.quantize(Decimal("0.01"))
 
     def _apply_dialog_styles(self) -> None:
         self.setStyleSheet(
@@ -2053,6 +2171,7 @@ class StoreManagerCustomerDashboardScreen(QWidget):
         _apply_compact_table_style(self.future_table, row_height=28, embedded=True)
         _apply_compact_table_style(self.customer_table, row_height=28, embedded=True)
         self.clear_context()
+        install_action_logging(self, screen=self.__class__.__name__, context=self._log_context)
 
     def set_context(
         self,
@@ -2063,6 +2182,7 @@ class StoreManagerCustomerDashboardScreen(QWidget):
         self._current_user_id = current_user_id
         self._store_context = store_context
         self._set_feedback("", tone="success")
+        self.refresh_language()
         self.refresh_data()
 
     def clear_context(self) -> None:
@@ -2079,7 +2199,7 @@ class StoreManagerCustomerDashboardScreen(QWidget):
         self._order_queue_rows = ()
         self.due_date_filter.blockSignals(True)
         self.due_date_filter.clear()
-        self.due_date_filter.addItem("All Due Dates")
+        self.due_date_filter.addItem(tr("All Due Dates", self._language_code()))
         self.due_date_filter.blockSignals(False)
         self._set_ordered_items_count(0)
         self.search_input.clear()
@@ -2092,6 +2212,25 @@ class StoreManagerCustomerDashboardScreen(QWidget):
         self._set_feedback("", tone="success")
         self._set_table_rows(())
         self._set_future_table_rows(())
+
+    def refresh_language(self) -> None:
+        language_code = self._language_code()
+        apply_widget_translations(self, language_code)
+        translate_table_headers(self.customer_table, self.TABLE_HEADERS, language_code)
+        translate_table_headers(self.future_table, self.FUTURE_HEADERS, language_code)
+        self._set_ordered_items_count(len(self._order_queue_rows))
+        self._refresh_pagination_controls()
+
+    def _language_code(self) -> str:
+        if self._store_context is None:
+            return "en"
+        return self._store_context.manager_language_code
+
+    def _log_context(self) -> dict[str, object]:
+        return {
+            "user_id": self._current_user_id or "",
+            "store_id": self._store_context.store_id if self._store_context is not None else "",
+        }
 
     def refresh_data(self) -> None:
         if self._store_context is None:
@@ -2107,6 +2246,12 @@ class StoreManagerCustomerDashboardScreen(QWidget):
         self._refresh_order_queue()
 
     def _apply_search(self) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "apply_customer_search",
+            query_length=len(self.search_input.text().strip()),
+            **self._log_context(),
+        )
         self._search_timer.stop()
         if self._store_context is None:
             self._set_table_rows(())
@@ -2137,11 +2282,23 @@ class StoreManagerCustomerDashboardScreen(QWidget):
         self._search_timer.start()
 
     def _show_previous_page(self) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "show_previous_customer_page",
+            page=self._current_page,
+            **self._log_context(),
+        )
         if self._current_page <= 0:
             return
         self._load_active_page(self._current_page - 1)
 
     def _show_next_page(self) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "show_next_customer_page",
+            page=self._current_page,
+            **self._log_context(),
+        )
         if (self._current_page + 1) * self.CUSTOMER_PAGE_SIZE >= self._total_customer_rows:
             return
         self._load_active_page(self._current_page + 1)
@@ -2245,7 +2402,10 @@ class StoreManagerCustomerDashboardScreen(QWidget):
                 empty_text = (
                     f"No customer found for '{self._active_query}'. Use Add New to create this customer."
                     if self._active_query
-                    else "No customers found for this store. Use Add New to create the first customer."
+                    else tr(
+                        "No customers found for this store. Use Add New to create the first customer.",
+                        self._language_code(),
+                    )
                 )
                 empty_item = QTableWidgetItem(
                     empty_text
@@ -2292,7 +2452,9 @@ class StoreManagerCustomerDashboardScreen(QWidget):
             if not rows:
                 self.future_table.setRowCount(1)
                 self.future_table.setSpan(0, 0, 1, self.future_table.columnCount())
-                empty_item = QTableWidgetItem("No store orders available yet.")
+                empty_item = QTableWidgetItem(
+                    tr("No store orders available yet.", self._language_code())
+                )
                 empty_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
                 self.future_table.setItem(0, 0, empty_item)
                 for column_index in range(1, self.future_table.columnCount()):
@@ -2325,6 +2487,11 @@ class StoreManagerCustomerDashboardScreen(QWidget):
             self.future_table.setUpdatesEnabled(True)
 
     def _open_add_customer_dialog(self) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "open_add_customer_dialog",
+            **self._log_context(),
+        )
         if self._current_user_id is None or self._store_context is None:
             return
         item_rows = self._operations_service.list_items(store_id=self._store_context.store_id)
@@ -2336,6 +2503,7 @@ class StoreManagerCustomerDashboardScreen(QWidget):
         dialog = CustomerOrderEntryDialog(
             item_rows=item_rows,
             created_by_name=creator_name or "Current manager",
+            language_code=self._language_code(),
             parent=self,
         )
         while dialog.exec() == QDialog.DialogCode.Accepted:
@@ -2352,8 +2520,15 @@ class StoreManagerCustomerDashboardScreen(QWidget):
                 status=str(payload["order_status"]),
                 paid_amount=payload["paid_amount"],  # type: ignore[arg-type]
                 items=order_items,
+                weight=payload["weight"],  # type: ignore[arg-type]
             )
             try:
+                log_ui_action(
+                    self.__class__.__name__,
+                    "create_customer_with_order",
+                    item_count=len(order_items),
+                    **self._log_context(),
+                )
                 self._operations_service.create_customer_with_orders(
                     store_id=self._store_context.store_id,
                     full_name=str(payload["full_name"]),
@@ -2374,6 +2549,12 @@ class StoreManagerCustomerDashboardScreen(QWidget):
             break
 
     def _open_customer_details_dialog(self, row: int, _column: int) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "open_customer_details_dialog",
+            row=row,
+            **self._log_context(),
+        )
         if self._store_context is None:
             return
         if row < 0 or row >= len(self._visible_customer_rows):
@@ -2408,6 +2589,7 @@ class StoreManagerCustomerDashboardScreen(QWidget):
             created_by_name=self._user_management_service.display_name_for_user(self._current_user_id)
             if self._current_user_id is not None
             else "Current manager",
+            language_code=self._language_code(),
             parent=self,
         ).exec()
         self.refresh_data()
@@ -2459,16 +2641,23 @@ class StoreManagerCustomerDashboardScreen(QWidget):
                 if row.due_date is not None
             }
         )
-        resolved_value = current_value if current_value in due_dates else "All Due Dates"
+        all_due_dates_label = tr("All Due Dates", self._language_code())
+        resolved_value = current_value if current_value in due_dates else all_due_dates_label
         self.due_date_filter.blockSignals(True)
         self.due_date_filter.clear()
-        self.due_date_filter.addItems(["All Due Dates", *due_dates])
+        self.due_date_filter.addItems([all_due_dates_label, *due_dates])
         self.due_date_filter.setCurrentText(resolved_value)
         self.due_date_filter.blockSignals(False)
 
     def _apply_due_date_filter(self) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "apply_ordered_items_due_date_filter",
+            due_date=self.due_date_filter.currentText(),
+            **self._log_context(),
+        )
         selected_due_date = self.due_date_filter.currentText()
-        if selected_due_date == "All Due Dates":
+        if selected_due_date == tr("All Due Dates", self._language_code()):
             rows = self._order_queue_rows
             self._set_future_table_rows(rows)
             self._set_ordered_items_count(len(rows))
@@ -2483,7 +2672,9 @@ class StoreManagerCustomerDashboardScreen(QWidget):
         self._set_ordered_items_count(len(rows))
 
     def _set_ordered_items_count(self, count: int) -> None:
-        self.ordered_items_count_label.setText(f"Total Items: {max(0, count)}")
+        self.ordered_items_count_label.setText(
+            f"{tr('Total Items', self._language_code())}: {max(0, count)}"
+        )
 
     def _set_feedback(self, message: str, *, tone: str) -> None:
         self._feedback_clear_timer.stop()
@@ -2510,16 +2701,25 @@ class StoreManagerCustomerDashboardScreen(QWidget):
         )
         current_page = min(self._current_page + 1, total_pages)
         if self._total_customer_rows == 0:
-            self.pagination_label.setText("Showing 0 to 0 of 0 entries")
+            empty_label = {
+                "mr": "0 पैकी 0 ते 0 दाखवत आहे",
+                "hi": "0 में से 0 से 0 दिखा रहे हैं",
+            }.get(self._language_code(), "Showing 0 to 0 of 0 entries")
+            self.pagination_label.setText(empty_label)
         else:
             start = (self._current_page * self.CUSTOMER_PAGE_SIZE) + 1
             end = min(
                 start + len(self._visible_customer_rows) - 1,
                 self._total_customer_rows,
             )
-            self.pagination_label.setText(
-                f"Showing {start} to {end} of {self._total_customer_rows} entries"
+            label = {
+                "mr": f"{self._total_customer_rows} पैकी {start} ते {end} दाखवत आहे",
+                "hi": f"{self._total_customer_rows} में से {start} से {end} दिखा रहे हैं",
+            }.get(
+                self._language_code(),
+                f"Showing {start} to {end} of {self._total_customer_rows} entries",
             )
+            self.pagination_label.setText(label)
         self.previous_page_button.setEnabled(self._current_page > 0)
         self.next_page_button.setEnabled(
             (self._current_page + 1) * self.CUSTOMER_PAGE_SIZE < self._total_customer_rows
@@ -2548,6 +2748,11 @@ class StoreManagerCustomerDashboardScreen(QWidget):
             button.setMaximumWidth(34)
             button.clicked.connect(
                 lambda _checked=False, number=page_number: self._load_active_page(number - 1)
+            )
+            attach_action_logging(
+                button,
+                screen=self.__class__.__name__,
+                context=self._log_context,
             )
             self._page_buttons_layout.addWidget(button)
             self._page_buttons.append(button)

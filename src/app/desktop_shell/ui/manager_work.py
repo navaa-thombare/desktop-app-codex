@@ -19,8 +19,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.admin.services import AdminUserManagementService, StoreDashboardContext, StoreStaffRow
-from app.operations.services import OperationsService, OrderManagementItemRow
+from app.admin.services import AdminUserManagementService, StoreDashboardContext
+from app.desktop_shell.ui.action_logging import (
+    attach_action_logging,
+    install_action_logging,
+    log_ui_action,
+)
+from app.desktop_shell.i18n import apply_widget_translations, tr, translate_table_headers
+from app.operations.services import OperationsService, OrderManagementItemRow, WorkerAssignmentSummaryRow
 
 
 class StoreManagerWorkManagementScreen(QWidget):
@@ -48,7 +54,7 @@ class StoreManagerWorkManagementScreen(QWidget):
         self._operations_service = operations_service
         self._current_user_id: str | None = None
         self._store_context: StoreDashboardContext | None = None
-        self._workers: tuple[StoreStaffRow, ...] = ()
+        self._workers: tuple[WorkerAssignmentSummaryRow, ...] = ()
         self._rows: tuple[OrderManagementItemRow, ...] = ()
         self._apply_styles()
 
@@ -66,14 +72,17 @@ class StoreManagerWorkManagementScreen(QWidget):
         self.total_assigned_value = QLabel("0")
         self.total_institching_value = QLabel("0")
         self.total_hold_value = QLabel("0")
+        self.total_ready_value = QLabel("0")
         top_layout.addWidget(filter_card, 0, 0)
         top_layout.addWidget(self._metric_block("TOTAL ASSIGNED", self.total_assigned_value), 0, 1)
         top_layout.addWidget(self._metric_block("TOTAL INSTITCHING", self.total_institching_value), 0, 2)
         top_layout.addWidget(self._metric_block("TOTAL HOLD", self.total_hold_value), 0, 3)
+        top_layout.addWidget(self._metric_block("TOTAL READY", self.total_ready_value), 0, 4)
         top_layout.setColumnStretch(0, 2)
         top_layout.setColumnStretch(1, 1)
         top_layout.setColumnStretch(2, 1)
         top_layout.setColumnStretch(3, 1)
+        top_layout.setColumnStretch(4, 1)
 
         table_card = QFrame()
         table_card.setObjectName("InnerCard")
@@ -108,6 +117,7 @@ class StoreManagerWorkManagementScreen(QWidget):
 
         self.worker_filter.currentIndexChanged.connect(lambda _index=0: self.refresh_data())
         self.clear_context()
+        install_action_logging(self, screen=self.__class__.__name__, context=self._log_context)
 
     def set_context(
         self,
@@ -117,6 +127,7 @@ class StoreManagerWorkManagementScreen(QWidget):
     ) -> None:
         self._current_user_id = current_user_id
         self._store_context = store_context
+        self.refresh_language()
         self.refresh_data()
 
     def clear_context(self) -> None:
@@ -128,13 +139,25 @@ class StoreManagerWorkManagementScreen(QWidget):
         self._set_worker_filter()
         self._set_table_rows(())
 
+    def refresh_language(self) -> None:
+        language_code = self._language_code()
+        apply_widget_translations(self, language_code)
+        translate_table_headers(self.work_table, self.TABLE_HEADERS, language_code)
+        if self.worker_filter.count() > 0:
+            self.worker_filter.setItemText(0, tr("All Workers", language_code))
+
+    def _language_code(self) -> str:
+        if self._store_context is None:
+            return "en"
+        return self._store_context.manager_language_code
+
     def refresh_data(self) -> None:
         if self._store_context is None:
             self.clear_context()
             return
         selected_worker_id = self.worker_filter.currentData()
         worker_id = selected_worker_id if isinstance(selected_worker_id, str) else ""
-        self._workers = self._user_management_service.list_store_workers(
+        self._workers = self._operations_service.list_worker_assignment_summary_for_store(
             store_id=self._store_context.store_id
         )
         self._set_worker_filter(selected_worker_id=worker_id)
@@ -149,13 +172,14 @@ class StoreManagerWorkManagementScreen(QWidget):
         self.total_assigned_value.setText(str(sum(1 for row in rows if row.item_status == "ASSIGNED")))
         self.total_institching_value.setText(str(sum(1 for row in rows if row.item_status == "INSTITCHING")))
         self.total_hold_value.setText(str(sum(1 for row in rows if row.item_status == "HOLD")))
+        self.total_ready_value.setText(str(sum(1 for row in rows if row.item_status == "READY")))
 
     def _set_worker_filter(self, *, selected_worker_id: str = "") -> None:
         self.worker_filter.blockSignals(True)
         self.worker_filter.clear()
-        self.worker_filter.addItem("All Workers", "")
+        self.worker_filter.addItem(tr("All Workers", self._language_code()), "")
         for worker in self._workers:
-            self.worker_filter.addItem(worker.full_name, worker.user_id)
+            self.worker_filter.addItem(worker.worker_name, worker.worker_id)
         for index in range(self.worker_filter.count()):
             if self.worker_filter.itemData(index) == selected_worker_id:
                 self.worker_filter.setCurrentIndex(index)
@@ -168,7 +192,9 @@ class StoreManagerWorkManagementScreen(QWidget):
         if not rows:
             self.work_table.setRowCount(1)
             self.work_table.setSpan(0, 0, 1, self.work_table.columnCount())
-            empty_item = QTableWidgetItem("No assigned work available for the selected worker.")
+            empty_item = QTableWidgetItem(
+                tr("No assigned work available for the selected worker.", self._language_code())
+            )
             empty_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             self.work_table.setItem(0, 0, empty_item)
             for column_index in range(1, self.work_table.columnCount()):
@@ -206,7 +232,7 @@ class StoreManagerWorkManagementScreen(QWidget):
             action_layout = QHBoxLayout(action_cell)
             action_layout.setContentsMargins(0, 0, 0, 0)
             action_layout.setSpacing(0)
-            action_button = QPushButton("Update")
+            action_button = QPushButton(tr("Update", self._language_code()))
             action_button.setObjectName("InlineActionButton")
             action_button.setFixedSize(58, self.CONTROL_HEIGHT)
             action_button.setEnabled(False)
@@ -215,15 +241,32 @@ class StoreManagerWorkManagementScreen(QWidget):
                     value != original
                 )
             )
+            attach_action_logging(
+                status_combo,
+                screen=self.__class__.__name__,
+                context=self._log_context,
+            )
             action_button.clicked.connect(
                 lambda _checked=False, order_item_id=row.order_item_id, combo=status_combo: (
                     self._update_item_status(order_item_id, combo.currentText())
                 )
             )
+            attach_action_logging(
+                action_button,
+                screen=self.__class__.__name__,
+                context=self._log_context,
+            )
             action_layout.addWidget(action_button, alignment=Qt.AlignmentFlag.AlignCenter)
             self.work_table.setCellWidget(row_index, 5, action_cell)
 
     def _update_item_status(self, order_item_id: int, status: str) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "update_order_item_status",
+            order_item_id=order_item_id,
+            status=status,
+            **self._log_context(),
+        )
         if self._store_context is None:
             return
         try:
@@ -235,6 +278,12 @@ class StoreManagerWorkManagementScreen(QWidget):
         except ValueError:
             return
         self.refresh_data()
+
+    def _log_context(self) -> dict[str, object]:
+        return {
+            "user_id": self._current_user_id or "",
+            "store_id": self._store_context.store_id if self._store_context is not None else "",
+        }
 
     def _filter_card(self) -> QWidget:
         card = QWidget()

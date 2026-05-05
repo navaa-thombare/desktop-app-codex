@@ -84,6 +84,7 @@ class ManagedStoreModel(Base):
     owner_mobile: Mapped[str | None] = mapped_column(String(50), nullable=True)
     owner_email: Mapped[str | None] = mapped_column(String(200), nullable=True)
     store_admin_user_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    manager_language_code: Mapped[str] = mapped_column(String(10), nullable=False, default="en")
     status: Mapped[str] = mapped_column(String(40), nullable=False)
     created_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -165,6 +166,7 @@ class StoreStaffRow:
     speciality: str
     joining_date: datetime
     role_name: str
+    roles: tuple[str, ...]
     username: str
     created_by_name: str
 
@@ -177,6 +179,7 @@ class StaffMemberProfile:
     speciality: str
     joining_date: datetime
     role_name: str
+    roles: tuple[str, ...]
     username: str
     created_by_user_id: str | None
     created_by_name: str
@@ -206,6 +209,7 @@ class AdminStoreRecord:
     store_admin_full_name: str
     store_admin_mobile: str
     store_admin_email: str
+    manager_language_code: str
     status: str
     created_on: datetime
     updated_on: datetime
@@ -230,6 +234,7 @@ class StoreDashboardContext:
     owner_name: str
     owner_mobile: str
     owner_email: str
+    manager_language_code: str
     status: str
     user_count: int
 
@@ -250,6 +255,7 @@ class AdminUserManagementService:
         "Superadmin",
         "Admin",
         "Manager",
+        "Accountant",
         "Worker",
     )
     ROLE_PERMISSION_MAP = {
@@ -293,6 +299,8 @@ class AdminUserManagementService:
             "order:status:fulfilled",
             "billing:view",
             "billing:update",
+            "worker:payment:view",
+            "worker:payment:update",
         ),
         "Admin": (
             "nav:home",
@@ -319,6 +327,13 @@ class AdminUserManagementService:
             "order:status:fulfilled",
             "billing:view",
             "billing:update",
+        ),
+        "Accountant": (
+            "nav:home",
+            "nav:operations",
+            "worker:payment:view",
+            "worker:payment:update",
+            "billing:view",
         ),
         "Worker": (
             "nav:home",
@@ -352,22 +367,26 @@ class AdminUserManagementService:
         "READY",
     )
     STORE_STATUS_OPTIONS = ("Active", "Inactive")
+    MANAGER_LANGUAGE_OPTIONS = ("en", "mr", "hi")
     CREATOR_ROLE_SCOPE = {
-        "Superadmin": ("Admin", "Manager", "Worker"),
-        "Admin": ("Manager", "Worker"),
+        "Superadmin": ("Admin", "Manager", "Accountant", "Worker"),
+        "Admin": ("Manager", "Accountant", "Worker"),
         "Manager": (),
+        "Accountant": (),
         "Worker": (),
     }
     ROLE_SCOPE_MAP = {
         "Superadmin": "Global",
         "Admin": "Administration",
         "Manager": "Operations",
+        "Accountant": "Finance",
         "Worker": "Operations",
     }
     ROLE_DESCRIPTION_MAP = {
         "Superadmin": "Full application control, including store lifecycle management, store-admin management, role creation, and permission administration.",
         "Admin": "Manages non-superadmin users and administrative workflows.",
         "Manager": "Handles customers, orders, billing updates, and fulfillment changes.",
+        "Accountant": "Handles worker payment management and payment review for store operations.",
         "Worker": "Reads order details and updates in-progress operational statuses.",
     }
 
@@ -616,6 +635,7 @@ class AdminUserManagementService:
                 owner_mobile=normalized_owner["owner_mobile"],
                 owner_email=normalized_owner["owner_email"],
                 store_admin_user_id=store_admin_user_id,
+                manager_language_code="en",
                 status=normalized_store["status"],
                 created_on=now,
                 updated_on=now,
@@ -1004,7 +1024,8 @@ class AdminUserManagementService:
                     contact_number=self._contact_number_for_user(row),
                     speciality=(row.speciality or "").strip(),
                     joining_date=self._ensure_utc(row.joining_date or row.created_on),
-                    role_name=self._normalized_role_for_existing_user(row),
+                    role_name=", ".join(self._normalized_roles_for_existing_user(row)),
+                    roles=self._normalized_roles_for_existing_user(row),
                     username=row.username,
                     created_by_name=creator_lookup.get(row.created_by_user_id or "", ""),
                 )
@@ -1013,7 +1034,7 @@ class AdminUserManagementService:
                     (actor_role == "Superadmin" or row.user_id != actor_user_id)
                     and (
                         actor_role == "Superadmin"
-                        or self._normalized_role_for_existing_user(row) in allowed_roles
+                        or bool(set(self._normalized_roles_for_existing_user(row)) & allowed_roles)
                     )
                     and (
                         not created_by_actor_only
@@ -1045,12 +1066,13 @@ class AdminUserManagementService:
                     contact_number=self._contact_number_for_user(row),
                     speciality=(row.speciality or "").strip(),
                     joining_date=self._ensure_utc(row.joining_date or row.created_on),
-                    role_name=self._normalized_role_for_existing_user(row),
+                    role_name=", ".join(self._normalized_roles_for_existing_user(row)),
+                    roles=self._normalized_roles_for_existing_user(row),
                     username=row.username,
                     created_by_name=creator_lookup.get(row.created_by_user_id or "", ""),
                 )
                 for row in rows
-                if self._normalized_role_for_existing_user(row) == "Worker"
+                if "Worker" in self._normalized_roles_for_existing_user(row)
             )
 
     def get_staff_member_profile(
@@ -1074,7 +1096,8 @@ class AdminUserManagementService:
                 contact_number=self._contact_number_for_user(user),
                 speciality=(user.speciality or "").strip(),
                 joining_date=self._ensure_utc(user.joining_date or user.created_on),
-                role_name=self._normalized_role_for_existing_user(user),
+                role_name=", ".join(self._normalized_roles_for_existing_user(user)),
+                roles=self._normalized_roles_for_existing_user(user),
                 username=user.username,
                 created_by_user_id=user.created_by_user_id,
                 created_by_name=self._creator_name_for_user(session=session, user=user),
@@ -1089,7 +1112,8 @@ class AdminUserManagementService:
         contact_number: str,
         speciality: str,
         joining_date: datetime,
-        role_name: str,
+        role_name: str | None = None,
+        role_names: list[str] | tuple[str, ...] | None = None,
     ) -> StaffMemberSaveResult:
         actor_role = self.role_name_for_user(actor_user_id)
         if actor_role != "Admin":
@@ -1106,9 +1130,9 @@ class AdminUserManagementService:
         )
         normalized_speciality = speciality.strip()
         normalized_joining_date = self._normalize_joining_date(joining_date)
-        selected_role = self._normalize_staff_role_for_actor(
+        selected_roles = self._normalize_staff_roles_for_actor(
             actor_user_id=actor_user_id,
-            role_name=role_name,
+            role_names=role_names if role_names is not None else [role_name or ""],
         )
         store_scope_id = self._resolve_store_scope(actor_user_id=actor_user_id)
         temporary_password = self.default_password_for_username(normalized_username)
@@ -1129,8 +1153,8 @@ class AdminUserManagementService:
                 contact_info=normalized_contact_number,
                 store_id=store_scope_id,
                 created_on=created_on,
-                roles=[selected_role],
-                permissions=self._permissions_for_selected_role(selected_role),
+                roles=list(selected_roles),
+                permissions=self._permissions_for_selected_roles(selected_roles),
                 activities=[
                     (
                         created_on,
@@ -1166,7 +1190,8 @@ class AdminUserManagementService:
         contact_number: str,
         speciality: str,
         joining_date: datetime,
-        role_name: str,
+        role_name: str | None = None,
+        role_names: list[str] | tuple[str, ...] | None = None,
     ) -> StaffMemberSaveResult:
         normalized_full_name = self._normalize_required_value(
             full_name,
@@ -1178,9 +1203,9 @@ class AdminUserManagementService:
         )
         normalized_speciality = speciality.strip()
         normalized_joining_date = self._normalize_joining_date(joining_date)
-        selected_role = self._normalize_staff_role_for_actor(
+        selected_roles = self._normalize_staff_roles_for_actor(
             actor_user_id=actor_user_id,
-            role_name=role_name,
+            role_names=role_names if role_names is not None else [role_name or ""],
         )
 
         with self._session_factory() as session:
@@ -1199,13 +1224,14 @@ class AdminUserManagementService:
             user.joining_date = normalized_joining_date
             user.roles[:] = [
                 ManagedUserRoleModel(user_id=user.user_id, role_name=selected_role)
+                for selected_role in selected_roles
             ]
             user.permissions[:] = [
                 ManagedUserPermissionModel(
                     user_id=user.user_id,
                     permission_name=permission_name,
                 )
-                for permission_name in self._permissions_for_selected_role(selected_role)
+                for permission_name in self._permissions_for_selected_roles(selected_roles)
             ]
             if user.auth_record is not None:
                 user.auth_record.mobile = normalized_contact_number
@@ -1246,9 +1272,42 @@ class AdminUserManagementService:
                 owner_name=store.owner_name or "",
                 owner_mobile=store.owner_mobile or "",
                 owner_email=store.owner_email or "",
+                manager_language_code=self._normalize_manager_language_code(
+                    store.manager_language_code
+                ),
                 status=store.status,
                 user_count=int(user_count),
             )
+
+    def update_manager_language_for_store_admin(
+        self,
+        *,
+        actor_user_id: str | None,
+        language_code: str,
+    ) -> StoreDashboardContext:
+        store_id = self.store_id_for_user(actor_user_id)
+        actor_role = self.role_name_for_user(actor_user_id)
+        if not store_id:
+            raise ValueError("This account is not linked to a store profile.")
+        if actor_role != "Admin":
+            raise ValueError("Only the store admin can update manager language settings.")
+
+        normalized_language_code = self._normalize_manager_language_code(language_code)
+        with self._session_factory() as session:
+            store = session.get(ManagedStoreModel, store_id)
+            if store is None:
+                raise ValueError("The linked store record was not found.")
+            if store.store_admin_user_id != actor_user_id:
+                raise ValueError("Only the linked store admin can update this store setting.")
+
+            store.manager_language_code = normalized_language_code
+            store.updated_on = datetime.now(tz=timezone.utc)
+            session.commit()
+
+        updated_context = self.get_store_dashboard_context_for_user(actor_user_id)
+        if updated_context is None:
+            raise ValueError("The linked store context could not be reloaded.")
+        return updated_context
 
     def update_store_profile_for_user(
         self,
@@ -1630,6 +1689,8 @@ class AdminUserManagementService:
                     updated = True
                 if not store.owner_email:
                     store.owner_email = self._extract_email(store.contact_info) or ""
+                if not store.manager_language_code:
+                    store.manager_language_code = "en"
                     updated = True
             if updated:
                 session.commit()
@@ -1656,12 +1717,15 @@ class AdminUserManagementService:
             auth_updated = False
             data_updated = False
             for user in users:
-                selected_role = self._normalized_role_for_existing_user(user)
-                derived_permissions = self._permissions_for_selected_role(selected_role)
-                if tuple(role.role_name for role in user.roles) != (selected_role,):
-                    user.roles[:] = [ManagedUserRoleModel(user_id=user.user_id, role_name=selected_role)]
+                selected_roles = self._normalized_roles_for_existing_user(user)
+                derived_permissions = self._permissions_for_selected_roles(selected_roles)
+                if tuple(role.role_name for role in user.roles) != selected_roles:
+                    user.roles[:] = [
+                        ManagedUserRoleModel(user_id=user.user_id, role_name=selected_role)
+                        for selected_role in selected_roles
+                    ]
                     data_updated = True
-                if tuple(sorted(permission.permission_name for permission in user.permissions)) != derived_permissions:
+                if tuple(permission.permission_name for permission in user.permissions) != tuple(derived_permissions):
                     user.permissions[:] = [
                         ManagedUserPermissionModel(
                             user_id=user.user_id,
@@ -1712,8 +1776,8 @@ class AdminUserManagementService:
                     continue
                 if not user.store_id:
                     continue
-                normalized_role = self._normalized_role_for_existing_user(user)
-                if normalized_role not in {"Manager", "Worker"}:
+                normalized_roles = set(self._normalized_roles_for_existing_user(user))
+                if not normalized_roles & {"Manager", "Accountant", "Worker"}:
                     continue
                 store = stores.get(user.store_id)
                 if store is None or not store.store_admin_user_id:
@@ -1822,6 +1886,9 @@ class AdminUserManagementService:
                 if store_admin is not None
                 else ""
             ),
+            manager_language_code=self._normalize_manager_language_code(
+                row.manager_language_code
+            ),
             status=row.status,
             created_on=self._ensure_utc(row.created_on),
             updated_on=self._ensure_utc(row.updated_on),
@@ -1918,12 +1985,33 @@ class AdminUserManagementService:
         actor_user_id: str | None,
         role_name: str,
     ) -> str:
-        selected_role = role_name.strip().title()
-        allowed_roles = set(self.available_roles_for_actor(actor_user_id)) & {"Manager", "Worker"}
-        if selected_role not in allowed_roles:
-            allowed_label = ", ".join(sorted(allowed_roles)) or "Manager, Worker"
+        return self._normalize_staff_roles_for_actor(
+            actor_user_id=actor_user_id,
+            role_names=[role_name],
+        )[0]
+
+    def _normalize_staff_roles_for_actor(
+        self,
+        *,
+        actor_user_id: str | None,
+        role_names: list[str] | tuple[str, ...],
+    ) -> tuple[str, ...]:
+        requested_roles = tuple(
+            dict.fromkeys(role_name.strip().title() for role_name in role_names if role_name.strip())
+        )
+        allowed_roles = set(self.available_roles_for_actor(actor_user_id)) & {
+            "Manager",
+            "Accountant",
+            "Worker",
+        }
+        if not requested_roles:
+            allowed_label = ", ".join(sorted(allowed_roles)) or "Manager, Accountant, Worker"
+            raise ValueError(f"Select at least one staff role: {allowed_label}.")
+        disallowed_roles = [role_name for role_name in requested_roles if role_name not in allowed_roles]
+        if disallowed_roles:
+            allowed_label = ", ".join(sorted(allowed_roles)) or "Manager, Accountant, Worker"
             raise ValueError(f"This account can only assign these staff roles: {allowed_label}.")
-        return selected_role
+        return self._ordered_role_names(requested_roles)
 
     def _assert_staff_manageable(
         self,
@@ -1937,14 +2025,12 @@ class AdminUserManagementService:
             return
 
         actor_store_id = self.store_id_for_user(actor_user_id)
-        target_role = self._normalized_role_for_existing_user(target_user)
+        target_roles = set(self._normalized_roles_for_existing_user(target_user))
         allowed_roles = set(self.available_roles_for_actor(actor_user_id))
         if actor_store_id is None or target_user.store_id != actor_store_id:
             raise ValueError("This account cannot manage staff outside the active store.")
-        if target_role not in allowed_roles:
+        if not target_roles or not target_roles.issubset(allowed_roles):
             raise ValueError("This account cannot manage the selected user.")
-        if require_creator_match and actor_user_id is not None and target_user.created_by_user_id != actor_user_id:
-            raise ValueError("This account can only manage staff members it created.")
 
     def _normalize_store_fields(
         self,
@@ -2090,6 +2176,7 @@ class AdminUserManagementService:
             "owner_mobile": "ALTER TABLE managed_stores ADD COLUMN owner_mobile VARCHAR(50)",
             "owner_email": "ALTER TABLE managed_stores ADD COLUMN owner_email VARCHAR(200)",
             "store_admin_user_id": "ALTER TABLE managed_stores ADD COLUMN store_admin_user_id VARCHAR(50)",
+            "manager_language_code": "ALTER TABLE managed_stores ADD COLUMN manager_language_code VARCHAR(10)",
         }
         missing_statements = [
             statement
@@ -2127,37 +2214,65 @@ class AdminUserManagementService:
     def _permissions_for_selected_role(self, role_name: str) -> list[str]:
         return list(self.permissions_for_role(role_name))
 
+    def _permissions_for_selected_roles(self, role_names: tuple[str, ...] | list[str]) -> list[str]:
+        requested_permissions = {
+            permission_name
+            for role_name in role_names
+            for permission_name in self.permissions_for_role(role_name)
+        }
+        return [
+            permission_name
+            for permission_name in self.permission_options()
+            if permission_name in requested_permissions
+        ]
+
     def _normalized_role_for_existing_user(self, user: ManagedUserModel) -> str:
+        normalized_roles = self._normalized_roles_for_existing_user(user)
+        return normalized_roles[0] if normalized_roles else "Worker"
+
+    def _normalized_roles_for_existing_user(self, user: ManagedUserModel) -> tuple[str, ...]:
         role_names = {role.role_name for role in user.roles}
         permission_names = {permission.permission_name for permission in user.permissions}
 
-        for role_name in self.ROLE_OPTIONS:
-            if role_name in role_names:
-                return role_name
+        normalized_roles = [
+            role_name
+            for role_name in self.ROLE_OPTIONS
+            if role_name in role_names
+        ]
+        if normalized_roles:
+            return tuple(normalized_roles)
 
         if user.username == "superadmin":
-            return "Superadmin"
+            return ("Superadmin",)
         if user.username == "admin":
-            return "Admin"
+            return ("Admin",)
         if role_names & {"System Admin"}:
-            return "Superadmin" if user.username == "admin" else "Admin"
+            return ("Superadmin" if user.username == "admin" else "Admin",)
         if role_names & {"Billing Analyst"}:
-            return "Manager"
+            return ("Accountant",)
         if role_names & {"Support Agent"}:
-            return "Worker"
+            return ("Worker",)
         if role_names & {"Audit Reader", "Security Officer"}:
-            return "Admin"
+            return ("Admin",)
         if {"customer:create", "customer:update", "billing:update"} & permission_names:
-            return "Manager"
+            return ("Manager",)
+        if {"worker:payment:view", "worker:payment:update"} & permission_names:
+            return ("Accountant",)
         if {"order:status:inprogress", "order:status:hold", "order:status:ready"} <= permission_names:
-            return "Worker"
-        return "Worker"
+            return ("Worker",)
+        return ("Worker",)
 
     def _normalize_store_status(self, status: str) -> str:
         normalized_status = status.strip().title()
         if normalized_status not in self.STORE_STATUS_OPTIONS:
             raise ValueError("Store status must be Active or Inactive.")
         return normalized_status
+
+    def _normalize_manager_language_code(self, language_code: str | None) -> str:
+        normalized_language_code = (language_code or "en").strip().lower()
+        if normalized_language_code not in self.MANAGER_LANGUAGE_OPTIONS:
+            return "en"
+        return normalized_language_code
 
     def _normalize_permission_values(self, permissions: list[str]) -> list[str]:
         ordered_permissions = dict.fromkeys(
@@ -2184,6 +2299,8 @@ class AdminUserManagementService:
             return (0, 1, role_name.lower())
         if role_name == "Manager":
             return (0, 2, role_name.lower())
-        if role_name == "Worker":
+        if role_name == "Accountant":
             return (0, 3, role_name.lower())
+        if role_name == "Worker":
+            return (0, 4, role_name.lower())
         return (1, 99, role_name.lower())

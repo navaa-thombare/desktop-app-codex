@@ -101,6 +101,7 @@ class ItemModel(Base):
     store_id: Mapped[str] = mapped_column(String(50), nullable=False)
     item_name: Mapped[str] = mapped_column(String(160), nullable=False)
     cost: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    making_charges: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     created_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -136,6 +137,7 @@ class MeasurementModel(Base):
     item_id: Mapped[str] = mapped_column(String(50), nullable=False)
     item_name: Mapped[str] = mapped_column(String(160), nullable=False)
     measurements: Mapped[str] = mapped_column(String(240), nullable=False)
+    weight: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
     measurement_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
@@ -195,6 +197,7 @@ class ItemRow:
     store_id: str
     item_name: str
     cost: Decimal
+    making_charges: Decimal
     created_on: datetime
     updated_on: datetime
 
@@ -207,6 +210,7 @@ class MeasurementRow:
     item_name: str
     measurements: str
     measurement_date: datetime | None
+    weight: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -235,6 +239,7 @@ class CustomerOrderCreateInput:
     status: str
     paid_amount: Decimal
     items: tuple[OrderItemCreateInput, ...]
+    weight: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -288,9 +293,20 @@ class WorkerAssignmentSummaryRow:
 
 
 @dataclass(frozen=True)
+class WorkerPaymentItemRow:
+    customer_name: str
+    item_name: str
+    item_status: str
+    worker_id: str
+    worker_name: str
+    making_charges: Decimal
+
+
+@dataclass(frozen=True)
 class CustomerOrderHistoryRow:
     order_id: str
     title: str
+    order_quantity: int
     order_date: datetime
     due_date: datetime | None
     priority: str
@@ -639,6 +655,51 @@ class OperationsService:
                 for order, item in rows
             )
 
+    def list_worker_payment_items_for_store(
+        self,
+        *,
+        store_id: str,
+        worker_id: str = "",
+    ) -> tuple[WorkerPaymentItemRow, ...]:
+        normalized_store_id = store_id.strip()
+        normalized_worker_id = worker_id.strip()
+        if not normalized_store_id:
+            return ()
+
+        with self._session_factory() as session:
+            statement = (
+                select(OrderModel, OrderItemModel, ItemModel)
+                .join(CustomerModel, CustomerModel.customer_id == OrderModel.customer_id)
+                .join(OrderItemModel, OrderItemModel.order_id == OrderModel.order_id)
+                .join(
+                    ItemModel,
+                    (ItemModel.store_id == CustomerModel.store_id)
+                    & (ItemModel.item_id == OrderItemModel.item_id),
+                )
+                .where(CustomerModel.store_id == normalized_store_id)
+                .where(OrderItemModel.status == "READY")
+                .where(OrderItemModel.assigned_worker_id != "")
+                .order_by(
+                    OrderItemModel.assigned_worker_name.asc(),
+                    OrderModel.due_on.asc(),
+                    OrderItemModel.order_item_id.asc(),
+                )
+            )
+            if normalized_worker_id:
+                statement = statement.where(OrderItemModel.assigned_worker_id == normalized_worker_id)
+            rows = session.execute(statement).all()
+            return tuple(
+                WorkerPaymentItemRow(
+                    customer_name=order.customer.full_name,
+                    item_name=order_item.item_name,
+                    item_status=order_item.status,
+                    worker_id=order_item.assigned_worker_id,
+                    worker_name=order_item.assigned_worker_name,
+                    making_charges=Decimal(item.making_charges).quantize(Decimal("0.01")),
+                )
+                for order, order_item, item in rows
+            )
+
     def assign_order_item_to_worker(
         self,
         *,
@@ -751,6 +812,7 @@ class OperationsService:
         store_id: str,
         item_name: str,
         cost: Decimal,
+        making_charges: Decimal = Decimal("0.00"),
     ) -> str:
         normalized_store_id = store_id.strip()
         normalized_item_name = item_name.strip()
@@ -760,10 +822,13 @@ class OperationsService:
             raise ValueError("Item name is required.")
         if cost < Decimal("0.00"):
             raise ValueError("Item cost cannot be negative.")
+        if making_charges < Decimal("0.00"):
+            raise ValueError("Making charges cannot be negative.")
 
         now = datetime.now(tz=timezone.utc)
         item_id = f"ITEM-{now.strftime('%Y%m%d%H%M%S')}-{now.microsecond:06d}"
         normalized_cost = cost.quantize(Decimal("0.01"))
+        normalized_making_charges = making_charges.quantize(Decimal("0.01"))
         with self._session_factory() as session:
             existing_item = session.scalar(
                 select(ItemModel).where(
@@ -779,6 +844,7 @@ class OperationsService:
                 store_id=normalized_store_id,
                 item_name=normalized_item_name,
                 cost=normalized_cost,
+                making_charges=normalized_making_charges,
                 created_on=now,
                 updated_on=now,
             )
@@ -793,6 +859,7 @@ class OperationsService:
         item_id: str,
         item_name: str,
         cost: Decimal,
+        making_charges: Decimal = Decimal("0.00"),
     ) -> None:
         normalized_store_id = store_id.strip()
         normalized_item_id = item_id.strip()
@@ -805,6 +872,8 @@ class OperationsService:
             raise ValueError("Item name is required.")
         if cost < Decimal("0.00"):
             raise ValueError("Item cost cannot be negative.")
+        if making_charges < Decimal("0.00"):
+            raise ValueError("Making charges cannot be negative.")
 
         with self._session_factory() as session:
             item = session.scalar(
@@ -828,6 +897,7 @@ class OperationsService:
 
             item.item_name = normalized_item_name
             item.cost = cost.quantize(Decimal("0.01"))
+            item.making_charges = making_charges.quantize(Decimal("0.01"))
             item.updated_on = datetime.now(tz=timezone.utc)
             session.commit()
 
@@ -911,9 +981,20 @@ class OperationsService:
                 .where(MeasurementModel.customer_id == normalized_customer_id)
                 .order_by(MeasurementModel.measurement_date.desc(), MeasurementModel.measurement_id.desc())
             ).all()
+            customer_weight = next(
+                (
+                    Decimal(row.weight).quantize(Decimal("0.01"))
+                    for row in measurement_rows
+                    if row.weight is not None
+                ),
+                None,
+            )
             measurement_by_item_id: dict[str, MeasurementRow] = {}
             for row in measurement_rows:
-                measurement_by_item_id.setdefault(row.item_id, self._to_measurement_row(row))
+                measurement_by_item_id.setdefault(
+                    row.item_id,
+                    self._to_measurement_row(row, fallback_weight=customer_weight),
+                )
             if not normalized_store_id:
                 return tuple(measurement_by_item_id.values())
 
@@ -932,6 +1013,7 @@ class OperationsService:
                         item_name=item.item_name,
                         measurements="",
                         measurement_date=None,
+                        weight=customer_weight,
                     ),
                 )
                 for item in items
@@ -963,6 +1045,7 @@ class OperationsService:
                 CustomerOrderHistoryRow(
                     order_id=order.order_id,
                     title=order.title,
+                    order_quantity=max(1, len(order.items)),
                     order_date=self._ensure_utc(order.created_on),
                     due_date=self._ensure_optional_utc(order.due_on),
                     priority=order.priority,
@@ -1372,6 +1455,7 @@ class OperationsService:
         customer_id: str,
         measurement_id: int,
         measurements: str,
+        weight: Decimal | None = None,
     ) -> None:
         normalized_store_id = store_id.strip()
         normalized_customer_id = customer_id.strip()
@@ -1392,7 +1476,10 @@ class OperationsService:
             )
             if measurement is None:
                 raise ValueError("The selected measurement could not be found for this customer.")
+            normalized_weight = self._normalize_weight(weight)
             measurement.measurements = measurements.strip()
+            if normalized_weight is not None:
+                measurement.weight = normalized_weight
             measurement.measurement_date = datetime.now(tz=timezone.utc)
             session.commit()
 
@@ -1405,15 +1492,17 @@ class OperationsService:
         item_name: str,
         measurements: str,
         measurement_id: int | None = None,
+        weight: Decimal | None = None,
     ) -> None:
         normalized_store_id = store_id.strip()
         normalized_customer_id = customer_id.strip()
         normalized_item_id = item_id.strip()
         normalized_item_name = item_name.strip()
         normalized_measurements = measurements.strip()
+        normalized_weight = self._normalize_weight(weight)
         if not normalized_store_id or not normalized_customer_id or not normalized_item_id:
             raise ValueError("Store, customer, and item are required before saving measurements.")
-        if not normalized_measurements:
+        if not normalized_measurements and normalized_weight is None:
             return
 
         with self._session_factory() as session:
@@ -1457,16 +1546,20 @@ class OperationsService:
                     item_id=normalized_item_id,
                     item_name=normalized_item_name or item.item_name,
                     measurements=normalized_measurements,
+                    weight=normalized_weight,
                     measurement_date=now,
                 )
                 session.add(measurement)
             else:
                 measurement.measurements = normalized_measurements
+                if normalized_weight is not None:
+                    measurement.weight = normalized_weight
                 measurement.measurement_date = now
             session.flush()
             session.commit()
 
     def _backfill_measurements_for_customer(self, *, session: Session, customer_id: str) -> bool:
+        customer_weight = self._measurement_weight_for_customer(session=session, customer_id=customer_id)
         order_items = session.scalars(
             select(OrderItemModel)
             .join(OrderModel, OrderModel.order_id == OrderItemModel.order_id)
@@ -1495,6 +1588,7 @@ class OperationsService:
                     item_id=order_item.item_id,
                     item_name=order_item.item_name,
                     measurements=measurement_text,
+                    weight=customer_weight,
                     measurement_date=self._ensure_utc(order_item.updated_on),
                 )
                 session.add(measurement)
@@ -1532,6 +1626,7 @@ class OperationsService:
             raise ValueError("Paid amount cannot be negative.")
         if not order_input.items:
             raise ValueError("Add at least one order item before saving.")
+        normalized_weight = self._normalize_weight(order_input.weight)
 
         order_total = Decimal("0.00")
         quantity = 0
@@ -1566,30 +1661,34 @@ class OperationsService:
                 measurement = session.get(MeasurementModel, item_input.measurement_id)
                 if measurement is None or measurement.customer_id != customer_id:
                     raise ValueError("The selected measurement could not be found for this customer.")
+                if normalized_weight is not None:
+                    measurement.weight = normalized_weight
                 measurement_text = measurement.measurements
-            elif measurement_text:
+            elif measurement_text or normalized_weight is not None:
                 measurement = MeasurementModel(
                     customer_id=customer_id,
                     item_id=item_input.item_id.strip(),
                     item_name=item_input.item_name.strip(),
                     measurements=measurement_text,
+                    weight=normalized_weight,
                     measurement_date=self._ensure_utc(item_input.updated_on),
                 )
-            order.items.append(
-                OrderItemModel(
-                    order_id=order_id,
-                    item_id=item_input.item_id.strip(),
-                    item_name=item_input.item_name.strip(),
-                    quantity=item_input.quantity,
-                    measurement=measurement,
-                    measurements=measurement_text,
-                    rate=item_input.rate.quantize(Decimal("0.01")),
-                    line_amount=line_amount,
-                    status=(item_input.status.strip().upper() or normalized_status),
-                    updated_on=self._ensure_utc(item_input.updated_on),
-                    updated_by=item_input.updated_by.strip(),
+            for _unit_index in range(item_input.quantity):
+                order.items.append(
+                    OrderItemModel(
+                        order_id=order_id,
+                        item_id=item_input.item_id.strip(),
+                        item_name=item_input.item_name.strip(),
+                        quantity=1,
+                        measurement=measurement,
+                        measurements=measurement_text,
+                        rate=item_input.rate.quantize(Decimal("0.01")),
+                        line_amount=item_input.rate.quantize(Decimal("0.01")),
+                        status=(item_input.status.strip().upper() or normalized_status),
+                        updated_on=self._ensure_utc(item_input.updated_on),
+                        updated_by=item_input.updated_by.strip(),
+                    )
                 )
-            )
 
         order.quantity = quantity
         order.order_total = order_total.quantize(Decimal("0.01"))
@@ -1634,6 +1733,12 @@ class OperationsService:
                 "assigned_worker_id": "ALTER TABLE ops_order_items ADD COLUMN assigned_worker_id VARCHAR(50) NOT NULL DEFAULT ''",
                 "assigned_worker_name": "ALTER TABLE ops_order_items ADD COLUMN assigned_worker_name VARCHAR(150) NOT NULL DEFAULT ''",
                 "assigned_on": "ALTER TABLE ops_order_items ADD COLUMN assigned_on DATETIME",
+            },
+            "ops_items": {
+                "making_charges": "ALTER TABLE ops_items ADD COLUMN making_charges NUMERIC(12, 2) NOT NULL DEFAULT 0",
+            },
+            "ops_measurements": {
+                "weight": "ALTER TABLE ops_measurements ADD COLUMN weight NUMERIC(8, 2)",
             },
         }
 
@@ -1692,6 +1797,27 @@ class OperationsService:
         if normalized_paid >= normalized_total:
             return "PAID"
         return "PARTPAID"
+
+    def _normalize_weight(self, weight: Decimal | None) -> Decimal | None:
+        if weight is None:
+            return None
+        normalized_weight = Decimal(weight).quantize(Decimal("0.01"))
+        if normalized_weight < Decimal("0.00"):
+            raise ValueError("Customer weight cannot be negative.")
+        return normalized_weight
+
+    def _measurement_weight_for_customer(self, *, session: Session, customer_id: str) -> Decimal | None:
+        row = session.scalar(
+            select(MeasurementModel)
+            .where(
+                MeasurementModel.customer_id == customer_id,
+                MeasurementModel.weight.is_not(None),
+            )
+            .order_by(MeasurementModel.measurement_date.desc(), MeasurementModel.measurement_id.desc())
+        )
+        if row is None or row.weight is None:
+            return None
+        return Decimal(row.weight).quantize(Decimal("0.01"))
 
     def _customer_search_filter(self, normalized_query: str):
         return (
@@ -1829,7 +1955,12 @@ class OperationsService:
             updated_by=row.updated_by,
         )
 
-    def _to_measurement_row(self, row: MeasurementModel) -> MeasurementRow:
+    def _to_measurement_row(
+        self,
+        row: MeasurementModel,
+        *,
+        fallback_weight: Decimal | None = None,
+    ) -> MeasurementRow:
         return MeasurementRow(
             measurement_id=row.measurement_id,
             customer_id=row.customer_id,
@@ -1837,6 +1968,11 @@ class OperationsService:
             item_name=row.item_name,
             measurements=row.measurements,
             measurement_date=self._ensure_utc(row.measurement_date),
+            weight=(
+                Decimal(row.weight).quantize(Decimal("0.01"))
+                if row.weight is not None
+                else fallback_weight
+            ),
         )
 
     def _measurement_text_for_item(self, item: OrderItemModel) -> str:
@@ -1864,6 +2000,7 @@ class OperationsService:
             store_id=row.store_id,
             item_name=row.item_name,
             cost=Decimal(row.cost).quantize(Decimal("0.01")),
+            making_charges=Decimal(row.making_charges).quantize(Decimal("0.01")),
             created_on=self._ensure_utc(row.created_on),
             updated_on=self._ensure_utc(row.updated_on),
         )

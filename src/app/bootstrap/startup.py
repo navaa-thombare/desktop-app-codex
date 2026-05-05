@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
 
 from app.bootstrap.container import Container, build_container
@@ -33,6 +34,7 @@ def start_application(settings: AppSettings | None = None) -> int:
     logger.debug("Container initialized with DB URL %s", container.settings.db_url)
 
     qt_app = QApplication(sys.argv)
+    qt_app.setFont(QFont("Nirmala UI", 10))
     window = MainWindow(
         container.settings.app_name,
         container.auth_service,

@@ -20,6 +20,12 @@ from PySide6.QtWidgets import (
 )
 
 from app.admin.services import AdminUserManagementService, StoreDashboardContext, StoreStaffRow
+from app.desktop_shell.ui.action_logging import (
+    attach_action_logging,
+    install_action_logging,
+    log_ui_action,
+)
+from app.desktop_shell.i18n import apply_widget_translations, tr, translate_table_headers
 from app.operations.services import (
     OperationsService,
     OrderManagementItemRow,
@@ -34,11 +40,13 @@ class WorkerAssignDialog(QDialog):
         workers: tuple[StoreStaffRow, ...],
         current_worker_id: str = "",
         current_worker_name: str = "",
+        language_code: str = "en",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setModal(True)
-        self.setWindowTitle("Assign Worker" if not current_worker_id else "Reassign Worker")
+        self._language_code = language_code
+        self.setWindowTitle(tr("Assign Worker" if not current_worker_id else "Reassign Worker", language_code))
         self.setMinimumWidth(360)
         self.setStyleSheet(
             """
@@ -88,17 +96,17 @@ class WorkerAssignDialog(QDialog):
         root.setContentsMargins(18, 18, 18, 18)
         root.setSpacing(12)
 
-        title = QLabel("Assign Worker" if not current_worker_id else "Reassign Worker")
+        title = QLabel(tr("Assign Worker" if not current_worker_id else "Reassign Worker", language_code))
         title.setObjectName("SectionTitle")
         current_assignee = QLabel(
             f"Current assignee: {current_worker_name.strip() or current_worker_id.strip()}"
             if current_worker_id
-            else "Current assignee: Not assigned"
+            else tr("Current assignee: Not assigned", language_code)
         )
         current_assignee.setObjectName("SectionCopy")
         self.worker_combo = QComboBox()
         self.worker_combo.setMinimumHeight(36)
-        self.worker_combo.addItem("Select worker", "")
+        self.worker_combo.addItem(tr("Select worker", language_code), "")
         for worker in workers:
             self.worker_combo.addItem(worker.full_name, worker.user_id)
         if current_worker_id:
@@ -109,9 +117,9 @@ class WorkerAssignDialog(QDialog):
 
         actions = QHBoxLayout()
         actions.addStretch(1)
-        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button = QPushButton(tr("Cancel", language_code))
         self.cancel_button.setObjectName("SecondaryButton")
-        self.assign_button = QPushButton("Assign" if not current_worker_id else "Reassign")
+        self.assign_button = QPushButton(tr("Assign" if not current_worker_id else "Reassign", language_code))
         self.assign_button.setObjectName("ActionButton")
         actions.addWidget(self.cancel_button)
         actions.addWidget(self.assign_button)
@@ -123,6 +131,7 @@ class WorkerAssignDialog(QDialog):
 
         self.cancel_button.clicked.connect(self.reject)
         self.assign_button.clicked.connect(self.accept)
+        install_action_logging(self, screen=self.__class__.__name__)
 
     def selected_worker(self) -> tuple[str, str] | None:
         worker_id = self.worker_combo.currentData()
@@ -194,7 +203,7 @@ class StoreManagerOrdersManagementScreen(QWidget):
         self.due_date_filter.setObjectName("DueDateFilter")
         self.due_date_filter.setFixedHeight(30)
         self.due_date_filter.setMinimumWidth(180)
-        self.due_date_filter.addItem("All Due Dates", "")
+        self.due_date_filter.addItem(tr("All Due Dates", self._language_code()), "")
         filter_row.addWidget(filter_label)
         filter_row.addWidget(self.due_date_filter)
         filter_row.addStretch(1)
@@ -271,6 +280,7 @@ class StoreManagerOrdersManagementScreen(QWidget):
             lambda _index=0: self._apply_due_date_filter()
         )
         self.clear_context()
+        install_action_logging(self, screen=self.__class__.__name__, context=self._log_context)
 
     def set_context(
         self,
@@ -280,6 +290,7 @@ class StoreManagerOrdersManagementScreen(QWidget):
     ) -> None:
         self._current_user_id = current_user_id
         self._store_context = store_context
+        self.refresh_language()
         self.refresh_data()
 
     def clear_context(self) -> None:
@@ -291,6 +302,19 @@ class StoreManagerOrdersManagementScreen(QWidget):
         self._set_metrics(0, 0, 0, 0)
         self._set_table_rows(())
         self._set_worker_assignment_rows()
+
+    def refresh_language(self) -> None:
+        language_code = self._language_code()
+        apply_widget_translations(self, language_code)
+        translate_table_headers(self.orders_table, self.TABLE_HEADERS, language_code)
+        translate_table_headers(self.worker_table, self.WORKER_HEADERS, language_code)
+        if self.due_date_filter.count() > 0:
+            self.due_date_filter.setItemText(0, tr("All Due Dates", language_code))
+
+    def _language_code(self) -> str:
+        if self._store_context is None:
+            return "en"
+        return self._store_context.manager_language_code
 
     def refresh_data(self) -> None:
         if self._store_context is None:
@@ -335,7 +359,7 @@ class StoreManagerOrdersManagementScreen(QWidget):
         due_dates = sorted({row.due_date.date() for row in all_rows if row.due_date is not None})
         self.due_date_filter.blockSignals(True)
         self.due_date_filter.clear()
-        self.due_date_filter.addItem("All Due Dates", "")
+        self.due_date_filter.addItem(tr("All Due Dates", self._language_code()), "")
         for due_date in due_dates:
             value = datetime(due_date.year, due_date.month, due_date.day, tzinfo=timezone.utc)
             self.due_date_filter.addItem(due_date.strftime("%Y-%m-%d"), value)
@@ -346,6 +370,12 @@ class StoreManagerOrdersManagementScreen(QWidget):
         self.due_date_filter.blockSignals(False)
 
     def _apply_due_date_filter(self) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "apply_due_date_filter",
+            due_date=self.due_date_filter.currentText(),
+            **self._log_context(),
+        )
         self.refresh_data()
 
     def _set_metrics(
@@ -370,7 +400,7 @@ class StoreManagerOrdersManagementScreen(QWidget):
         if not self._workers:
             self.worker_table.setRowCount(1)
             self.worker_table.setSpan(0, 0, 1, self.worker_table.columnCount())
-            empty_item = QTableWidgetItem("No workers available.")
+            empty_item = QTableWidgetItem(tr("No workers available.", self._language_code()))
             empty_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             self.worker_table.setItem(0, 0, empty_item)
             for column_index in range(1, self.worker_table.columnCount()):
@@ -397,7 +427,9 @@ class StoreManagerOrdersManagementScreen(QWidget):
         if not rows:
             self.orders_table.setRowCount(1)
             self.orders_table.setSpan(0, 0, 1, self.orders_table.columnCount())
-            empty_item = QTableWidgetItem("No order items available for the selected filter.")
+            empty_item = QTableWidgetItem(
+                tr("No order items available for the selected filter.", self._language_code())
+            )
             empty_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             self.orders_table.setItem(0, 0, empty_item)
             for column_index in range(1, self.orders_table.columnCount()):
@@ -420,7 +452,9 @@ class StoreManagerOrdersManagementScreen(QWidget):
                 self.orders_table.setItem(row_index, column_index, item)
 
             is_assigned = bool(row.assigned_worker_name) and row.item_status == "ASSIGNED"
-            assign_button = QPushButton("Re-assign" if is_assigned else "Assign")
+            assign_button = QPushButton(
+                tr("Re-assign" if is_assigned else "Assign", self._language_code())
+            )
             assign_button.setObjectName("SmallActionButton")
             assign_button.setFixedSize(66 if is_assigned else 54, 20)
             assign_button.setToolTip(
@@ -433,9 +467,20 @@ class StoreManagerOrdersManagementScreen(QWidget):
                     order_item_id
                 )
             )
+            attach_action_logging(
+                assign_button,
+                screen=self.__class__.__name__,
+                context=self._log_context,
+            )
             self.orders_table.setCellWidget(row_index, 5, assign_button)
 
     def _open_assign_dialog(self, order_item_id: int) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "open_assign_dialog",
+            order_item_id=order_item_id,
+            **self._log_context(),
+        )
         if self._store_context is None:
             return
         if not self._workers:
@@ -446,6 +491,7 @@ class StoreManagerOrdersManagementScreen(QWidget):
             workers=self._workers,
             current_worker_id=current_row.assigned_worker_id if current_row is not None else "",
             current_worker_name=current_row.assigned_worker_name if current_row is not None else "",
+            language_code=self._language_code(),
             parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -456,6 +502,13 @@ class StoreManagerOrdersManagementScreen(QWidget):
             return
         worker_id, worker_name = selected_worker
         try:
+            log_ui_action(
+                self.__class__.__name__,
+                "assign_order_item_to_worker",
+                order_item_id=order_item_id,
+                worker_id=worker_id,
+                **self._log_context(),
+            )
             self._operations_service.assign_order_item_to_worker(
                 store_id=self._store_context.store_id,
                 order_item_id=order_item_id,
@@ -467,6 +520,12 @@ class StoreManagerOrdersManagementScreen(QWidget):
             return
         self._set_feedback("Order item assigned.", tone="success")
         self.refresh_data()
+
+    def _log_context(self) -> dict[str, object]:
+        return {
+            "user_id": self._current_user_id or "",
+            "store_id": self._store_context.store_id if self._store_context is not None else "",
+        }
 
     def _set_feedback(self, message: str, *, tone: str) -> None:
         self.feedback_label.setText(message)

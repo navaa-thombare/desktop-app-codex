@@ -1192,6 +1192,8 @@ class CustomerDetailsDialog(QDialog):
         self.new_order_button.clicked.connect(self._open_new_order_dialog)
         self.orders_table.cellClicked.connect(self._handle_order_row_clicked)
         self.mark_payment_button.clicked.connect(self._mark_payment)
+        self.payment_amount_input.textChanged.connect(lambda _value="": self._refresh_mark_payment_button_text())
+        self.payment_notes_input.textChanged.connect(self._refresh_mark_payment_button_text)
         self.delivered_button.clicked.connect(self._mark_delivered)
         self.save_measurements_button.clicked.connect(self._save_measurements)
         self._refresh_latest_order_summary()
@@ -1236,7 +1238,7 @@ class CustomerDetailsDialog(QDialog):
     def _build_order_summaries(self) -> tuple[dict[str, object], ...]:
         summaries: dict[str, dict[str, object]] = {}
         for row in self._order_history:
-            summary = summaries.setdefault(
+            summaries.setdefault(
                 row.order_id,
                 {
                     "order_id": row.order_id,
@@ -1724,6 +1726,35 @@ class CustomerDetailsDialog(QDialog):
             widget.setVisible(not is_paid)
         self.delivered_button.setVisible(is_paid)
         self.delivered_button.setEnabled(str(summary["status"]) != "DELIVERED")
+        self._refresh_mark_payment_button_text()
+
+    def _refresh_mark_payment_button_text(self) -> None:
+        summary = self._selected_order_summary()
+        if summary is None:
+            self.mark_payment_button.setText("Mark Payment")
+            return
+        balance_amount = summary["balance_amount"]
+        if not isinstance(balance_amount, Decimal):
+            self.mark_payment_button.setText("Mark Payment")
+            return
+
+        raw_amount = self.payment_amount_input.text().replace(",", "").strip()
+        notes = self.payment_notes_input.toPlainText().strip()
+        try:
+            amount = Decimal("0.00") if not raw_amount and notes else Decimal(raw_amount).quantize(Decimal("0.01"))
+        except Exception:
+            amount = None
+
+        should_deliver_without_full_payment = (
+            str(summary["status"]) == "READY"
+            and str(summary["bill_status"]) == "PARTPAID"
+            and amount is not None
+            and amount < balance_amount
+            and bool(notes)
+        )
+        self.mark_payment_button.setText(
+            "Deliver-WP" if should_deliver_without_full_payment else "Mark Payment"
+        )
 
     def _format_date(self, value: datetime | None) -> str:
         if value is None:

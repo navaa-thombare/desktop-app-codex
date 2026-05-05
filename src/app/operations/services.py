@@ -84,6 +84,7 @@ class OrderItemModel(Base):
     rate: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     line_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     status: Mapped[str] = mapped_column(String(40), nullable=False, default="NEW")
+    maker_pay_status: Mapped[str | None] = mapped_column(String(40), nullable=True, default="")
     assigned_worker_id: Mapped[str] = mapped_column(String(50), nullable=False, default="")
     assigned_worker_name: Mapped[str] = mapped_column(String(150), nullable=False, default="")
     assigned_on: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -139,6 +140,20 @@ class MeasurementModel(Base):
     measurements: Mapped[str] = mapped_column(String(240), nullable=False)
     weight: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
     measurement_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class WorkerPaymentModel(Base):
+    __tablename__ = "ops_worker_payments"
+
+    payment_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    store_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    worker_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    worker_name: Mapped[str] = mapped_column(String(150), nullable=False)
+    paid_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    payment_method: Mapped[str] = mapped_column(String(80), nullable=False, default="")
+    notes: Mapped[str] = mapped_column(String(240), nullable=False, default="")
+    payment_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    paid_by: Mapped[str] = mapped_column(String(50), nullable=False, default="")
 
 
 @dataclass(frozen=True)
@@ -300,6 +315,20 @@ class WorkerPaymentItemRow:
     worker_id: str
     worker_name: str
     making_charges: Decimal
+    updated_on: datetime
+    maker_pay_status: str
+
+
+@dataclass(frozen=True)
+class WorkerPaymentHistoryRow:
+    payment_id: int
+    worker_id: str
+    worker_name: str
+    payment_date: datetime
+    paid_amount: Decimal
+    payment_method: str
+    notes: str
+    paid_by: str
 
 
 @dataclass(frozen=True)
@@ -538,6 +567,10 @@ class OperationsService:
                 .join(CustomerModel, CustomerModel.customer_id == OrderModel.customer_id)
                 .where(CustomerModel.store_id == normalized_store_id)
                 .where(OrderItemModel.assigned_worker_id != "")
+                .where(
+                    (OrderItemModel.maker_pay_status.is_(None))
+                    | (OrderItemModel.maker_pay_status == "")
+                )
             ).all()
             summaries: dict[str, dict[str, object]] = {}
             for row in rows:
@@ -629,6 +662,10 @@ class OperationsService:
                 .join(OrderItemModel, OrderItemModel.order_id == OrderModel.order_id)
                 .where(CustomerModel.store_id == normalized_store_id)
                 .where(OrderItemModel.assigned_worker_id != "")
+                .where(
+                    (OrderItemModel.maker_pay_status.is_(None))
+                    | (OrderItemModel.maker_pay_status == "")
+                )
                 .order_by(
                     OrderItemModel.assigned_worker_name.asc(),
                     OrderModel.due_on.asc(),
@@ -660,6 +697,7 @@ class OperationsService:
         *,
         store_id: str,
         worker_id: str = "",
+        include_paid: bool = False,
     ) -> tuple[WorkerPaymentItemRow, ...]:
         normalized_store_id = store_id.strip()
         normalized_worker_id = worker_id.strip()
@@ -680,13 +718,17 @@ class OperationsService:
                 .where(OrderItemModel.status == "READY")
                 .where(OrderItemModel.assigned_worker_id != "")
                 .order_by(
-                    OrderItemModel.assigned_worker_name.asc(),
-                    OrderModel.due_on.asc(),
+                    OrderItemModel.updated_on.desc(),
                     OrderItemModel.order_item_id.asc(),
                 )
             )
             if normalized_worker_id:
                 statement = statement.where(OrderItemModel.assigned_worker_id == normalized_worker_id)
+            if not include_paid:
+                statement = statement.where(
+                    (OrderItemModel.maker_pay_status.is_(None))
+                    | (OrderItemModel.maker_pay_status == "")
+                )
             rows = session.execute(statement).all()
             return tuple(
                 WorkerPaymentItemRow(
@@ -696,9 +738,139 @@ class OperationsService:
                     worker_id=order_item.assigned_worker_id,
                     worker_name=order_item.assigned_worker_name,
                     making_charges=Decimal(item.making_charges).quantize(Decimal("0.01")),
+                    updated_on=self._ensure_utc(order_item.updated_on),
+                    maker_pay_status=(order_item.maker_pay_status or "").strip().upper(),
                 )
                 for order, order_item, item in rows
             )
+
+    def sync_worker_maker_pay_status_for_store(
+        self,
+        *,
+        store_id: str,
+        worker_id: str,
+    ) -> None:
+        normalized_store_id = store_id.strip()
+        normalized_worker_id = worker_id.strip()
+        if not normalized_store_id or not normalized_worker_id:
+            return
+
+        with self._session_factory() as session:
+            ready_rows = session.execute(
+                select(OrderItemModel, ItemModel)
+                .join(OrderModel, OrderModel.order_id == OrderItemModel.order_id)
+                .join(CustomerModel, CustomerModel.customer_id == OrderModel.customer_id)
+                .join(
+                    ItemModel,
+                    (ItemModel.store_id == CustomerModel.store_id)
+                    & (ItemModel.item_id == OrderItemModel.item_id),
+                )
+                .where(
+                    CustomerModel.store_id == normalized_store_id,
+                    OrderItemModel.assigned_worker_id == normalized_worker_id,
+                    OrderItemModel.status == "READY",
+                )
+            ).all()
+            if not ready_rows:
+                return
+
+            total_making_charges = sum(
+                (Decimal(item.making_charges).quantize(Decimal("0.01")) for _order_item, item in ready_rows),
+                Decimal("0.00"),
+            )
+            total_paid = (
+                session.scalar(
+                    select(func.coalesce(func.sum(WorkerPaymentModel.paid_amount), 0)).where(
+                        WorkerPaymentModel.store_id == normalized_store_id,
+                        WorkerPaymentModel.worker_id == normalized_worker_id,
+                    )
+                )
+                or Decimal("0.00")
+            )
+            if Decimal(total_paid).quantize(Decimal("0.01")) != total_making_charges:
+                return
+
+            changed = False
+            for order_item, _item in ready_rows:
+                if (order_item.maker_pay_status or "").strip().upper() != "PAID":
+                    order_item.maker_pay_status = "PAID"
+                    changed = True
+            if changed:
+                session.commit()
+
+    def list_worker_payment_history_for_store(
+        self,
+        *,
+        store_id: str,
+        worker_id: str,
+    ) -> tuple[WorkerPaymentHistoryRow, ...]:
+        normalized_store_id = store_id.strip()
+        normalized_worker_id = worker_id.strip()
+        if not normalized_store_id or not normalized_worker_id:
+            return ()
+
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(WorkerPaymentModel)
+                .where(
+                    WorkerPaymentModel.store_id == normalized_store_id,
+                    WorkerPaymentModel.worker_id == normalized_worker_id,
+                )
+                .order_by(
+                    WorkerPaymentModel.payment_date.desc(),
+                    WorkerPaymentModel.payment_id.desc(),
+                )
+            ).all()
+            return tuple(
+                WorkerPaymentHistoryRow(
+                    payment_id=row.payment_id,
+                    worker_id=row.worker_id,
+                    worker_name=row.worker_name,
+                    payment_date=self._ensure_utc(row.payment_date),
+                    paid_amount=Decimal(row.paid_amount).quantize(Decimal("0.01")),
+                    payment_method=row.payment_method,
+                    notes=row.notes,
+                    paid_by=row.paid_by,
+                )
+                for row in rows
+            )
+
+    def add_worker_payment_for_store(
+        self,
+        *,
+        store_id: str,
+        worker_id: str,
+        worker_name: str,
+        paid_amount: Decimal,
+        payment_method: str,
+        notes: str,
+        paid_by: str,
+    ) -> None:
+        normalized_store_id = store_id.strip()
+        normalized_worker_id = worker_id.strip()
+        normalized_worker_name = worker_name.strip()
+        if not normalized_store_id or not normalized_worker_id or not normalized_worker_name:
+            raise ValueError("Store and worker are required before recording worker payment.")
+
+        payment_amount = paid_amount.quantize(Decimal("0.01"))
+        if payment_amount <= Decimal("0.00"):
+            raise ValueError("Worker payment amount must be greater than zero.")
+
+        now = datetime.now(tz=timezone.utc)
+        with self._session_factory() as session:
+            session.add(
+                WorkerPaymentModel(
+                    store_id=normalized_store_id,
+                    worker_id=normalized_worker_id,
+                    worker_name=normalized_worker_name,
+                    paid_amount=payment_amount,
+                    payment_method=payment_method.strip(),
+                    notes=notes.strip(),
+                    payment_date=now,
+                    paid_by=paid_by.strip(),
+                )
+            )
+            session.commit()
 
     def assign_order_item_to_worker(
         self,
@@ -1381,6 +1553,9 @@ class OperationsService:
             payment_amount = paid_amount.quantize(Decimal("0.01"))
             current_paid = Decimal(order.paid_amount).quantize(Decimal("0.01"))
             order_total = Decimal(order.order_total).quantize(Decimal("0.01"))
+            balance_before_payment = (order_total - current_paid).quantize(Decimal("0.01"))
+            starting_status = order.status
+            starting_bill_status = order.bill_status
             normalized_notes = notes.strip()
             if payment_amount < Decimal("0.00"):
                 raise ValueError("Payment amount cannot be negative.")
@@ -1399,6 +1574,15 @@ class OperationsService:
             now = datetime.now(tz=timezone.utc)
             order.paid_amount = (current_paid + payment_amount).quantize(Decimal("0.01"))
             order.bill_status = self._bill_status_for_amounts(order_total, order.paid_amount)
+            if order.bill_status == "PAID":
+                order.status = "DELIVERED"
+            elif (
+                starting_status == "READY"
+                and starting_bill_status == "PARTPAID"
+                and payment_amount < balance_before_payment
+                and normalized_notes
+            ):
+                order.status = "Dlvred-WP"
             order.updated_on = now
             order.payments.append(
                 PaymentModel(
@@ -1730,6 +1914,7 @@ class OperationsService:
             "ops_order_items": {
                 "measurement_id": "ALTER TABLE ops_order_items ADD COLUMN measurement_id INTEGER",
                 "measurements": "ALTER TABLE ops_order_items ADD COLUMN measurements VARCHAR(240) NOT NULL DEFAULT ''",
+                "maker_pay_status": "ALTER TABLE ops_order_items ADD COLUMN maker_pay_status VARCHAR(40)",
                 "assigned_worker_id": "ALTER TABLE ops_order_items ADD COLUMN assigned_worker_id VARCHAR(50) NOT NULL DEFAULT ''",
                 "assigned_worker_name": "ALTER TABLE ops_order_items ADD COLUMN assigned_worker_name VARCHAR(150) NOT NULL DEFAULT ''",
                 "assigned_on": "ALTER TABLE ops_order_items ADD COLUMN assigned_on DATETIME",

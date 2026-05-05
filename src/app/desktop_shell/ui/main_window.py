@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QMainWindow,
     QPushButton,
+    QSizePolicy,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -51,7 +52,12 @@ from app.desktop_shell.ui.action_logging import install_action_logging, log_ui_a
 from app.desktop_shell.ui.manager_customer import StoreManagerCustomerDashboardScreen
 from app.desktop_shell.ui.manager_orders import StoreManagerOrdersManagementScreen
 from app.desktop_shell.ui.manager_work import StoreManagerWorkManagementScreen
-from app.operations.services import ItemRow, OperationsService, WorkerPaymentItemRow
+from app.operations.services import (
+    ItemRow,
+    OperationsService,
+    WorkerPaymentHistoryRow,
+    WorkerPaymentItemRow,
+)
 from app.platform.audit import AuditReviewService, AuditService
 
 
@@ -1462,12 +1468,21 @@ class StoreItemsCreateScreen(QWidget):
 
 
 class StorePaymentsScreen(QWidget):
-    TABLE_HEADERS = (
+    UNPAID_TABLE_HEADERS = (
         "Customer-item",
         "Item Status",
         "Worker Name",
+        "Updated On",
         "Making Charges",
     )
+    PAID_TABLE_HEADERS = (
+        "Customer-item",
+        "Item Status",
+        "Worker Name",
+        "Updated On",
+        "Maker's Pay Status",
+    )
+    HISTORY_HEADERS = ("Date", "Amount", "Method", "Notes")
 
     def __init__(
         self,
@@ -1483,6 +1498,8 @@ class StorePaymentsScreen(QWidget):
         self._store_context: StoreDashboardContext | None = None
         self._workers: tuple[StoreStaffRow, ...] = ()
         self._rows: tuple[WorkerPaymentItemRow, ...] = ()
+        self._metric_rows: tuple[WorkerPaymentItemRow, ...] = ()
+        self._payment_history: tuple[WorkerPaymentHistoryRow, ...] = ()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1500,9 +1517,16 @@ class StorePaymentsScreen(QWidget):
         self.total_items_value = QLabel("0")
         self.ready_items_value = QLabel("0")
         self.making_charges_value = QLabel("INR 0.00")
+        self.advance_paid_value = QLabel("INR 0.00")
+        self.dues_value = QLabel("INR 0.00")
         metrics_row.addWidget(self._metric_card("TOTAL ITEMS", self.total_items_value))
         metrics_row.addWidget(self._metric_card("READY ITEMS", self.ready_items_value))
-        metrics_row.addWidget(self._metric_card("MAKING CHARGES", self.making_charges_value))
+        self.making_charges_card = self._metric_card("MAKING CHARGES", self.making_charges_value)
+        self.advance_paid_card = self._metric_card("TOTAL PAID", self.advance_paid_value)
+        self.dues_card = self._metric_card("DUES", self.dues_value)
+        metrics_row.addWidget(self.making_charges_card)
+        metrics_row.addWidget(self.advance_paid_card)
+        metrics_row.addWidget(self.dues_card)
 
         content_row = QHBoxLayout()
         content_row.setContentsMargins(0, 0, 0, 0)
@@ -1516,13 +1540,97 @@ class StorePaymentsScreen(QWidget):
         right_section = QWidget()
         right_section.setObjectName("PaymentsDetailSection")
         right_layout = QVBoxLayout(right_section)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(0)
-        right_layout.addStretch(1)
+        right_layout.setContentsMargins(18, 18, 18, 18)
+        right_layout.setSpacing(12)
 
-        self.payments_table = QTableWidget(0, len(self.TABLE_HEADERS))
+        form_title = QLabel("Worker Payment")
+        form_title.setObjectName("SectionTitle")
+
+        payment_form = QVBoxLayout()
+        payment_form.setContentsMargins(0, 0, 0, 0)
+        payment_form.setSpacing(10)
+        self.worker_payment_amount_input = QLineEdit()
+        self.worker_payment_amount_input.setObjectName("WorkerPaymentCompactInput")
+        self.worker_payment_amount_input.setPlaceholderText("Enter amount")
+        self.worker_payment_amount_input.setFixedHeight(34)
+        self.worker_payment_amount_input.setMinimumWidth(0)
+        self.worker_payment_amount_input.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.worker_payment_method_combo = QComboBox()
+        self.worker_payment_method_combo.setObjectName("WorkerPaymentCompactInput")
+        self.worker_payment_method_combo.addItems(("Cash", "UPI", "Card", "Bank Transfer", "Other"))
+        self.worker_payment_method_combo.setFixedHeight(34)
+        self.worker_payment_method_combo.setMinimumWidth(0)
+        self.worker_payment_method_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.worker_payment_notes_input = QLineEdit()
+        self.worker_payment_notes_input.setObjectName("WorkerPaymentCompactInput")
+        self.worker_payment_notes_input.setPlaceholderText("Payment note")
+        self.worker_payment_notes_input.setFixedHeight(34)
+        self.worker_payment_notes_input.setMinimumWidth(0)
+        self.worker_payment_notes_input.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        amount_method_row = QHBoxLayout()
+        amount_method_row.setContentsMargins(0, 0, 0, 0)
+        amount_method_row.setSpacing(8)
+        amount_method_row.addWidget(
+            self._payment_field("Paying Amount", self.worker_payment_amount_input),
+            stretch=1,
+        )
+        amount_method_row.addWidget(
+            self._payment_field("Payment Method", self.worker_payment_method_combo),
+            stretch=1,
+        )
+        payment_form.addLayout(amount_method_row)
+        payment_form.addWidget(self._payment_field("Notes", self.worker_payment_notes_input))
+
+        self.record_worker_payment_button = QPushButton("Record Payment")
+        self.record_worker_payment_button.setObjectName("ActionButton")
+        self.record_worker_payment_button.setMinimumHeight(40)
+        self.record_worker_payment_button.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.worker_payment_feedback = QLabel("")
+        self.worker_payment_feedback.setObjectName("StatusMessage")
+        self.worker_payment_feedback.setWordWrap(True)
+        self.worker_payment_feedback.hide()
+
+        history_title = QLabel("Payment History")
+        history_title.setObjectName("SectionTitle")
+        self.worker_payment_history_table = QTableWidget(0, len(self.HISTORY_HEADERS))
+        self.worker_payment_history_table.setObjectName("PaymentsFlatTable")
+        self.worker_payment_history_table.setHorizontalHeaderLabels(list(self.HISTORY_HEADERS))
+        self.worker_payment_history_table.setAlternatingRowColors(True)
+        self.worker_payment_history_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.worker_payment_history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.worker_payment_history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.worker_payment_history_table.setShowGrid(False)
+        self.worker_payment_history_table.setMinimumHeight(180)
+        self.worker_payment_history_table.verticalHeader().setVisible(False)
+        self.worker_payment_history_table.verticalHeader().setDefaultSectionSize(28)
+        self.worker_payment_history_table.horizontalHeader().setStretchLastSection(False)
+        self.worker_payment_history_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.worker_payment_history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.worker_payment_history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.worker_payment_history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+
+        right_layout.addWidget(form_title)
+        right_layout.addLayout(payment_form)
+        right_layout.addWidget(self.record_worker_payment_button)
+        right_layout.addWidget(self.worker_payment_feedback)
+        right_layout.addWidget(history_title)
+        right_layout.addWidget(self.worker_payment_history_table, stretch=1)
+
+        self.payments_table = QTableWidget(0, len(self.UNPAID_TABLE_HEADERS))
         self.payments_table.setObjectName("PaymentsFlatTable")
-        self.payments_table.setHorizontalHeaderLabels(list(self.TABLE_HEADERS))
+        self.payments_table.setHorizontalHeaderLabels(list(self.UNPAID_TABLE_HEADERS))
         self.payments_table.setAlternatingRowColors(True)
         self.payments_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.payments_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1535,6 +1643,7 @@ class StorePaymentsScreen(QWidget):
         self.payments_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.payments_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.payments_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.payments_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         left_layout.addWidget(self.payments_table, stretch=1)
         content_row.addWidget(left_section, stretch=6)
         content_row.addWidget(right_section, stretch=4)
@@ -1543,6 +1652,7 @@ class StorePaymentsScreen(QWidget):
         root.addLayout(content_row, stretch=1)
 
         self.worker_filter.currentIndexChanged.connect(lambda _index=0: self.refresh_data())
+        self.record_worker_payment_button.clicked.connect(self._record_worker_payment)
         self.clear_context()
 
     def set_context(
@@ -1560,9 +1670,13 @@ class StorePaymentsScreen(QWidget):
         self._store_context = None
         self._workers = ()
         self._rows = ()
+        self._metric_rows = ()
+        self._payment_history = ()
         self._set_worker_filter()
-        self._set_metrics(())
+        self._set_metrics((), ())
         self._set_table_rows(())
+        self._set_payment_history_rows(())
+        self._refresh_payment_form_state()
 
     def refresh_data(self) -> None:
         if self._store_context is None:
@@ -1574,12 +1688,32 @@ class StorePaymentsScreen(QWidget):
             store_id=self._store_context.store_id
         )
         self._set_worker_filter(selected_worker_id=worker_id)
-        self._rows = self._operations_service.list_worker_payment_items_for_store(
+        self._payment_history = self._operations_service.list_worker_payment_history_for_store(
             store_id=self._store_context.store_id,
             worker_id=worker_id,
         )
-        self._set_metrics(self._rows)
+        if worker_id:
+            self._operations_service.sync_worker_maker_pay_status_for_store(
+                store_id=self._store_context.store_id,
+                worker_id=worker_id,
+            )
+        self._metric_rows = self._operations_service.list_worker_payment_items_for_store(
+            store_id=self._store_context.store_id,
+            worker_id=worker_id,
+            include_paid=True,
+        )
+        show_pay_status = self._should_show_maker_pay_status()
+        if show_pay_status:
+            self._rows = ()
+        else:
+            self._rows = self._operations_service.list_worker_payment_items_for_store(
+                store_id=self._store_context.store_id,
+                worker_id=worker_id,
+            )
+        self._set_metrics(self._rows, self._metric_rows)
         self._set_table_rows(self._rows)
+        self._set_payment_history_rows(self._payment_history)
+        self._refresh_payment_form_state()
 
     def _set_worker_filter(self, *, selected_worker_id: str = "") -> None:
         self.worker_filter.blockSignals(True)
@@ -1593,20 +1727,59 @@ class StorePaymentsScreen(QWidget):
                 break
         self.worker_filter.blockSignals(False)
 
-    def _set_metrics(self, rows: tuple[WorkerPaymentItemRow, ...]) -> None:
-        self.total_items_value.setText(str(len(rows)))
-        self.ready_items_value.setText(str(sum(1 for row in rows if row.item_status == "READY")))
-        self.making_charges_value.setText(
-            f"INR {sum((row.making_charges for row in rows), Decimal('0.00')):,.2f}"
-        )
+    def _set_metrics(
+        self,
+        count_rows: tuple[WorkerPaymentItemRow, ...],
+        money_rows: tuple[WorkerPaymentItemRow, ...],
+    ) -> None:
+        paid_amount = sum((row.paid_amount for row in self._payment_history), Decimal("0.00"))
+        making_charges = sum((row.making_charges for row in money_rows), Decimal("0.00"))
+        dues_amount = making_charges - paid_amount
+        has_selected_worker = self._selected_worker() is not None
+        self.total_items_value.setText(str(len(count_rows)))
+        self.ready_items_value.setText(str(sum(1 for row in count_rows if row.item_status == "READY")))
+        self.making_charges_value.setText(self._format_currency(making_charges))
+        self.advance_paid_value.setText(self._format_currency(paid_amount))
+        self.dues_value.setText("No Dues" if dues_amount == Decimal("0.00") else self._format_currency(dues_amount))
+        is_settled = making_charges == paid_amount
+        self.making_charges_card.setVisible(has_selected_worker and not is_settled)
+        self.advance_paid_card.setVisible(has_selected_worker and not is_settled)
+        self.dues_card.setVisible(has_selected_worker)
+
+    def _should_show_maker_pay_status(self) -> bool:
+        if self._selected_worker() is None:
+            return False
+        paid_amount = sum((row.paid_amount for row in self._payment_history), Decimal("0.00"))
+        making_charges = sum((row.making_charges for row in self._metric_rows), Decimal("0.00"))
+        return making_charges - paid_amount == Decimal("0.00")
+
+    def _configure_payments_table_columns(self, *, show_pay_status: bool) -> None:
+        headers = self.PAID_TABLE_HEADERS if show_pay_status else self.UNPAID_TABLE_HEADERS
+        if self.payments_table.columnCount() != len(headers):
+            self.payments_table.setColumnCount(len(headers))
+        self.payments_table.setHorizontalHeaderLabels(list(headers))
+        self.payments_table.horizontalHeader().setStretchLastSection(False)
+        self.payments_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for column_index in range(1, len(headers)):
+            self.payments_table.horizontalHeader().setSectionResizeMode(
+                column_index,
+                QHeaderView.ResizeMode.ResizeToContents,
+            )
 
     def _set_table_rows(self, rows: tuple[WorkerPaymentItemRow, ...]) -> None:
+        show_pay_status = self._should_show_maker_pay_status()
+        self._configure_payments_table_columns(show_pay_status=show_pay_status)
         self.payments_table.clearSpans()
         self.payments_table.clearContents()
         if not rows:
             self.payments_table.setRowCount(1)
             self.payments_table.setSpan(0, 0, 1, self.payments_table.columnCount())
-            empty_item = QTableWidgetItem("No payment items available for the selected worker.")
+            empty_message = (
+                "Maker's pay is PAID. No unpaid READY items to display."
+                if show_pay_status
+                else "No payment items available for the selected worker."
+            )
+            empty_item = QTableWidgetItem(empty_message)
             empty_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             self.payments_table.setItem(0, 0, empty_item)
             for column_index in range(1, self.payments_table.columnCount()):
@@ -1619,18 +1792,164 @@ class StorePaymentsScreen(QWidget):
                 f"{row.customer_name}/{row.item_name}",
                 row.item_status,
                 row.worker_name,
-                f"INR {row.making_charges:,.2f}",
+                self._format_date(row.updated_on),
+            )
+            if show_pay_status:
+                values = values + (row.maker_pay_status or "PAID",)
+            else:
+                values = values + (f"INR {row.making_charges:,.2f}",)
+            for column_index, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                alignment = (
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    if column_index == 4
+                    else Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                )
+                item.setTextAlignment(alignment)
+                self.payments_table.setItem(row_index, column_index, item)
+
+    def _set_payment_history_rows(self, rows: tuple[WorkerPaymentHistoryRow, ...]) -> None:
+        self.worker_payment_history_table.clearSpans()
+        self.worker_payment_history_table.clearContents()
+        if not rows:
+            self.worker_payment_history_table.setRowCount(1)
+            self.worker_payment_history_table.setSpan(
+                0,
+                0,
+                1,
+                self.worker_payment_history_table.columnCount(),
+            )
+            empty_item = QTableWidgetItem("No worker payment history found.")
+            empty_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.worker_payment_history_table.setItem(0, 0, empty_item)
+            for column_index in range(1, self.worker_payment_history_table.columnCount()):
+                self.worker_payment_history_table.setItem(0, column_index, QTableWidgetItem(""))
+            return
+
+        self.worker_payment_history_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            values = (
+                self._format_date(row.payment_date),
+                self._format_currency(row.paid_amount),
+                row.payment_method,
+                row.notes,
             )
             for column_index, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 alignment = (
                     Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-                    if column_index == 3
+                    if column_index == 1
                     else Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
                 )
                 item.setTextAlignment(alignment)
-                self.payments_table.setItem(row_index, column_index, item)
+                self.worker_payment_history_table.setItem(row_index, column_index, item)
+
+    def _record_worker_payment(self) -> None:
+        if self._store_context is None:
+            return
+        selected_worker = self._selected_worker()
+        if selected_worker is None:
+            self._set_worker_payment_feedback("Select a worker before recording payment.", tone="error")
+            return
+
+        raw_amount = self.worker_payment_amount_input.text().replace(",", "").strip()
+        try:
+            paid_amount = Decimal(raw_amount)
+        except (InvalidOperation, ValueError):
+            self._set_worker_payment_feedback("Enter a valid payment amount.", tone="error")
+            return
+
+        worker_id, worker_name = selected_worker
+        try:
+            self._operations_service.add_worker_payment_for_store(
+                store_id=self._store_context.store_id,
+                worker_id=worker_id,
+                worker_name=worker_name,
+                paid_amount=paid_amount,
+                payment_method=self.worker_payment_method_combo.currentText(),
+                notes=self.worker_payment_notes_input.text(),
+                paid_by=self._current_user_id or "",
+            )
+        except ValueError as exc:
+            self._set_worker_payment_feedback(str(exc), tone="error")
+            return
+
+        self.refresh_data()
+        self._refresh_worker_payment_history(worker_id=worker_id)
+        self.worker_payment_amount_input.clear()
+        self.worker_payment_notes_input.clear()
+        self._set_worker_payment_feedback("Worker payment recorded.", tone="success")
+
+    def _refresh_worker_payment_history(self, *, worker_id: str) -> None:
+        if self._store_context is None:
+            self._payment_history = ()
+            self._set_payment_history_rows(())
+            return
+        self._payment_history = self._operations_service.list_worker_payment_history_for_store(
+            store_id=self._store_context.store_id,
+            worker_id=worker_id,
+        )
+        self._set_payment_history_rows(self._payment_history)
+        self._set_metrics(self._rows, self._metric_rows)
+
+    def _selected_worker(self) -> tuple[str, str] | None:
+        worker_id = self.worker_filter.currentData()
+        if not isinstance(worker_id, str) or not worker_id:
+            return None
+        worker = next((row for row in self._workers if row.user_id == worker_id), None)
+        return worker_id, worker.full_name if worker is not None else self.worker_filter.currentText().strip()
+
+    def _refresh_payment_form_state(self) -> None:
+        has_worker = self._selected_worker() is not None
+        for widget in (
+            self.worker_payment_amount_input,
+            self.worker_payment_method_combo,
+            self.worker_payment_notes_input,
+            self.record_worker_payment_button,
+        ):
+            widget.setEnabled(has_worker)
+        if not has_worker:
+            self.worker_payment_amount_input.clear()
+            self.worker_payment_notes_input.clear()
+
+    def _set_worker_payment_feedback(self, message: str, *, tone: str) -> None:
+        self.worker_payment_feedback.setText(message)
+        self.worker_payment_feedback.setVisible(bool(message))
+        self.worker_payment_feedback.setProperty("tone", tone)
+        self.worker_payment_feedback.style().unpolish(self.worker_payment_feedback)
+        self.worker_payment_feedback.style().polish(self.worker_payment_feedback)
+        self.worker_payment_feedback.update()
+
+    def _form_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("FormLabel")
+        return label
+
+    def _payment_field(self, label_text: str, field: QWidget) -> QWidget:
+        container = QWidget()
+        container.setMinimumWidth(0)
+        container.setMinimumHeight(48)
+        container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        label = self._form_label(label_text)
+        label.setObjectName("WorkerPaymentCompactLabel")
+        label.setFixedHeight(12)
+        layout.addWidget(label)
+        layout.addWidget(field)
+        return container
+
+    def _format_date(self, value: datetime) -> str:
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%d")
+
+    def _format_currency(self, value: Decimal) -> str:
+        amount = Decimal(value).quantize(Decimal("0.01"))
+        if amount < Decimal("0.00"):
+            return f"INR -{abs(amount):,.2f}"
+        return f"INR {amount:,.2f}"
 
     def _worker_filter_metric(self) -> QFrame:
         card = QFrame()
@@ -3677,6 +3996,31 @@ class MainWindow(QMainWindow):
                 color: #1f2933;
                 selection-background-color: #ddebe8;
                 selection-color: #1f2933;
+            }
+            QLabel#WorkerPaymentCompactLabel {
+                color: #3d3025;
+                font-size: 8pt;
+                font-weight: 700;
+                padding: 0;
+                margin: 0;
+            }
+            QLineEdit#WorkerPaymentCompactInput,
+            QComboBox#WorkerPaymentCompactInput {
+                min-height: 34px;
+                max-height: 34px;
+                padding: 0;
+                margin: 0;
+                border: 1px solid #cbb9a3;
+                border-radius: 10px;
+                background-color: #ffffff;
+                color: #1f2933;
+                font-size: 8pt;
+            }
+            QComboBox#WorkerPaymentCompactInput::drop-down {
+                width: 20px;
+                border: none;
+                padding: 0;
+                margin: 0;
             }
             QPushButton {
                 min-width: 120px;

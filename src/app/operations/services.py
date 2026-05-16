@@ -254,6 +254,7 @@ class CustomerOrderCreateInput:
     status: str
     paid_amount: Decimal
     items: tuple[OrderItemCreateInput, ...]
+    payment_method: str = ""
     weight: Decimal | None = None
 
 
@@ -1885,7 +1886,7 @@ class OperationsService:
                     order_id=order_id,
                     customer_id=customer_id,
                     paid_amount=order.paid_amount,
-                    payment_method="",
+                    payment_method=order_input.payment_method.strip(),
                     notes="",
                     payment_date=created_on,
                 )

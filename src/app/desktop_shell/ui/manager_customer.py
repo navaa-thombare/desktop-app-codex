@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from html import escape
 
-from PySide6.QtCore import QDate, QTimer, Qt
+from PySide6.QtCore import QDate, QMarginsF, QTimer, Qt
+from PySide6.QtGui import QPageLayout, QPageSize, QTextDocument
+from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -21,6 +24,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QPushButton,
     QRadioButton,
+    QTextBrowser,
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
@@ -48,6 +52,8 @@ from app.operations.services import (
     PaymentHistoryRow,
     OperationsService,
     OrderItemCreateInput,
+    OrderItemRow,
+    OrderRow,
 )
 
 
@@ -86,6 +92,389 @@ class ManagerOrderItemDraft:
     @property
     def line_amount(self) -> Decimal:
         return (self.rate * Decimal(self.quantity)).quantize(Decimal("0.01"))
+
+
+@dataclass(frozen=True)
+class ReceiptLine:
+    item_name: str
+    quantity: int
+    rate: Decimal
+    amount: Decimal
+
+
+class OrderReceiptDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        store_name: str,
+        store_subtitle: str,
+        store_address: str,
+        store_contact: str,
+        customer: CustomerRow,
+        order: OrderRow,
+        items: tuple[OrderItemRow, ...],
+        payment_history: tuple[PaymentHistoryRow, ...],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Print Receipt")
+        self.setModal(True)
+        self.resize(560, 760)
+        self.setMinimumSize(520, 620)
+        self._html = self._build_html(
+            store_name=store_name,
+            store_subtitle=store_subtitle,
+            store_address=store_address,
+            store_contact=store_contact,
+            customer=customer,
+            order=order,
+            items=items,
+            payment_history=payment_history,
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        self.preview = QTextBrowser()
+        self.preview.setObjectName("ReceiptPreview")
+        self.preview.setOpenExternalLinks(False)
+        self.preview.setHtml(self._html)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        self.print_button = QPushButton("Print")
+        self.print_button.setObjectName("ReceiptPrimaryButton")
+        self.close_button = QPushButton("Close")
+        self.close_button.setObjectName("ReceiptSecondaryButton")
+        actions.addWidget(self.print_button)
+        actions.addWidget(self.close_button)
+
+        root.addWidget(self.preview, stretch=1)
+        root.addLayout(actions)
+
+        self.print_button.clicked.connect(self._print_receipt)
+        self.close_button.clicked.connect(self.accept)
+        self._apply_styles()
+
+    def _print_receipt(self) -> None:
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setPageSize(QPageSize(QPageSize.PageSizeId.A5))
+        printer.setPageOrientation(QPageLayout.Orientation.Portrait)
+        printer.setPageMargins(QMarginsF(8, 8, 8, 8), QPageLayout.Unit.Millimeter)
+        dialog = QPrintDialog(printer, self)
+        dialog.setWindowTitle("Print Receipt")
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        document = QTextDocument()
+        document.setHtml(self._html)
+        document.setPageSize(printer.pageRect(QPrinter.Unit.Point).size())
+        document.print_(printer)
+
+    def _build_html(
+        self,
+        *,
+        store_name: str,
+        store_subtitle: str,
+        store_address: str,
+        store_contact: str,
+        customer: CustomerRow,
+        order: OrderRow,
+        items: tuple[OrderItemRow, ...],
+        payment_history: tuple[PaymentHistoryRow, ...],
+    ) -> str:
+        lines = self._receipt_lines(items)
+        subtotal = sum((line.amount for line in lines), Decimal("0.00")).quantize(Decimal("0.01"))
+        discount = Decimal("0.00")
+        gst = Decimal("0.00")
+        grand_total = order.order_total.quantize(Decimal("0.01"))
+        paid_amount = order.paid_amount.quantize(Decimal("0.01"))
+        balance = max(Decimal("0.00"), grand_total - paid_amount).quantize(Decimal("0.01"))
+        payment_mode = self._payment_mode(payment_history)
+        order_date = order.created_on.astimezone().strftime("%a %b %d %Y %H:%M:%S")
+        due_date = order.due_on.astimezone().strftime("%a %b %d %Y") if order.due_on is not None else "--"
+        item_rows = "\n".join(
+            f"""
+            <tr>
+              <td>{escape(line.item_name)}</td>
+              <td class="numeric">{line.quantity}</td>
+              <td class="numeric">{self._money(line.rate, symbol=False)}</td>
+              <td class="numeric">{self._money(line.amount, symbol=False)}</td>
+            </tr>
+            """
+            for line in lines
+        )
+        return f"""
+        <!doctype html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <style>
+            @page {{ size: A5 portrait; margin: 8mm; }}
+            body {{
+              color: #111;
+              font-family: Arial, Helvetica, sans-serif;
+              font-size: 9pt;
+              margin: 0;
+            }}
+            .receipt {{
+              width: 100%;
+              padding: 0 4px;
+            }}
+            .store {{
+              text-align: center;
+              border-top: 2px solid #111;
+              padding-top: 6px;
+            }}
+            .store-name {{
+              font-size: 17pt;
+              font-weight: 800;
+              margin-bottom: 12px;
+            }}
+            .store-meta {{
+              line-height: 1.25;
+              margin-bottom: 20px;
+            }}
+            .rule {{
+              border-top: 1px solid #111;
+              margin: 0 0 12px;
+            }}
+            .title {{
+              font-size: 13pt;
+              font-weight: 800;
+              text-align: center;
+              margin: 0 0 16px;
+            }}
+            .right {{ text-align: right; }}
+            .dash {{
+              border-top: 1px dashed #111;
+              margin: 6px 0 5px;
+            }}
+            .meta-table {{
+              border-collapse: collapse;
+              width: 100%;
+              table-layout: fixed;
+              margin-bottom: 10px;
+            }}
+            .meta-table td {{
+              padding: 4px 2px;
+              vertical-align: top;
+            }}
+            .order-table {{
+              border-collapse: collapse;
+              width: 100%;
+              table-layout: fixed;
+              border-bottom: 1px solid #111;
+            }}
+            .order-table th {{
+              border-bottom: 1px solid #111;
+              font-weight: 800;
+              padding: 6px 4px;
+              text-align: left;
+            }}
+            .order-table td {{
+              padding: 5px 4px;
+              vertical-align: top;
+            }}
+            .numeric {{ text-align: right; }}
+            .summary {{
+              margin-left: auto;
+              width: 56%;
+              font-size: 8pt;
+            }}
+            .summary table {{
+              border-collapse: collapse;
+              width: 100%;
+              table-layout: fixed;
+            }}
+            .summary td {{
+              padding: 3px 0;
+            }}
+            .summary-label {{
+              text-align: right;
+              padding-right: 18px;
+            }}
+            .summary-value {{
+              text-align: right;
+              width: 40%;
+            }}
+            .grand {{
+              font-size: 13pt;
+              font-weight: 800;
+              line-height: 1.15;
+            }}
+            .grand td {{
+              border-top: 1px dashed #111;
+              padding-top: 5px;
+              padding-bottom: 5px;
+            }}
+            .grand-label {{
+              text-align: left;
+            }}
+            .payment {{
+              margin: 7px 0;
+              line-height: 1.55;
+            }}
+            .payment table {{
+              border-collapse: collapse;
+              width: 72%;
+            }}
+            .payment td {{
+              padding: 1px 4px;
+            }}
+            .payment-label {{
+              font-weight: 700;
+              width: 118px;
+            }}
+            .payment-colon {{
+              width: 10px;
+              text-align: center;
+            }}
+            .footer {{
+              text-align: center;
+              margin-top: 14px;
+              line-height: 1.35;
+            }}
+            .thanks {{
+              font-weight: 800;
+              font-size: 11pt;
+            }}
+            .star {{
+              margin-top: 8px;
+              font-weight: 800;
+            }}
+          </style>
+        </head>
+        <body>
+          <div class="receipt">
+            <div class="store">
+              <div class="store-name">{escape(store_name or "Store Name")}</div>
+              <div class="store-meta">
+                <div>{escape(store_subtitle or "Store sub-name")}</div>
+                <div>Contact : {escape(store_contact or "--")}</div>
+                <div>{escape(store_address or "Address")}</div>
+              </div>
+            </div>
+            <div class="rule"></div>
+            <div class="title">ORDER RECEIPT</div>
+            <table class="meta-table">
+              <tr>
+                <td>Customer ID : {escape(customer.customer_id)}</td>
+                <td class="right">{escape(order_date)}</td>
+              </tr>
+              <tr>
+                <td>Customer Name : {escape(customer.full_name)}</td>
+                <td class="right">Order Due Date : {escape(due_date)}</td>
+              </tr>
+            </table>
+            <div class="dash"></div>
+            <table class="order-table">
+              <colgroup>
+                <col style="width:45%">
+                <col style="width:12%">
+                <col style="width:20%">
+                <col style="width:23%">
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>Item</th>
+                  <th class="numeric">Qty</th>
+                  <th class="numeric">Rate</th>
+                  <th class="numeric">Amount</th>
+                </tr>
+              </thead>
+              <tbody>{item_rows}</tbody>
+            </table>
+            <div class="summary">
+              <table>
+                <tr><td class="summary-label">Subtotal</td><td class="summary-value">{self._money(subtotal, symbol=False)}</td></tr>
+                <tr><td class="summary-label">Discount (0%)</td><td class="summary-value">-{self._money(discount, symbol=False)}</td></tr>
+                <tr><td class="summary-label">GST (0%)</td><td class="summary-value">{self._money(gst, symbol=False)}</td></tr>
+                <tr class="grand"><td class="grand-label">GRAND TOTAL</td><td class="summary-value">&#8377; {self._money(grand_total, symbol=False)}</td></tr>
+              </table>
+            </div>
+            <div class="dash"></div>
+            <div class="payment">
+              <table>
+                <tr><td class="payment-label">Payment Mode</td><td class="payment-colon">:</td><td>{escape(payment_mode)}</td></tr>
+                <tr><td class="payment-label">Amount Paid</td><td class="payment-colon">:</td><td>&#8377; {self._money(paid_amount, symbol=False)}</td></tr>
+                <tr><td class="payment-label">Balance</td><td class="payment-colon">:</td><td>&#8377; {self._money(balance, symbol=False)}</td></tr>
+              </table>
+            </div>
+            <div class="dash"></div>
+            <div class="footer">
+              <div class="thanks">Thank you for your visit</div>
+              <div>Please keep this receipt for exchange</div>
+              <div class="star">---- * ----</div>
+            </div>
+          </div>
+        </body>
+        </html>
+        """
+
+    def _receipt_lines(self, items: tuple[OrderItemRow, ...]) -> tuple[ReceiptLine, ...]:
+        grouped: dict[tuple[str, Decimal], ReceiptLine] = {}
+        for item in items:
+            key = (item.item_name, item.rate)
+            current = grouped.get(key)
+            if current is None:
+                grouped[key] = ReceiptLine(
+                    item_name=item.item_name,
+                    quantity=item.quantity,
+                    rate=item.rate,
+                    amount=item.line_amount,
+                )
+                continue
+            grouped[key] = ReceiptLine(
+                item_name=current.item_name,
+                quantity=current.quantity + item.quantity,
+                rate=current.rate,
+                amount=(current.amount + item.line_amount).quantize(Decimal("0.01")),
+            )
+        return tuple(grouped.values())
+
+    def _payment_mode(self, payment_history: tuple[PaymentHistoryRow, ...]) -> str:
+        for payment in payment_history:
+            payment_method = payment.payment_method.strip()
+            if payment_method:
+                return payment_method
+        return "--"
+
+    def _money(self, value: Decimal, *, symbol: bool = True) -> str:
+        amount = f"{value.quantize(Decimal('0.01')):,.2f}"
+        return f"Rs. {amount}" if symbol else amount
+
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(
+            """
+            QDialog {
+                background-color: #f8fafc;
+            }
+            QTextBrowser#ReceiptPreview {
+                background-color: #ffffff;
+                border: 1px solid #d0d5dd;
+                border-radius: 6px;
+            }
+            QPushButton#ReceiptPrimaryButton {
+                min-height: 34px;
+                border: 1px solid #09213f;
+                border-radius: 6px;
+                background-color: #09213f;
+                color: #ffffff;
+                font-weight: 700;
+                padding: 0 18px;
+            }
+            QPushButton#ReceiptSecondaryButton {
+                min-height: 34px;
+                border: 1px solid #d0d5dd;
+                border-radius: 6px;
+                background-color: #ffffff;
+                color: #111827;
+                font-weight: 700;
+                padding: 0 18px;
+            }
+            """
+        )
 
 
 def _apply_compact_table_style(
@@ -377,10 +766,14 @@ class CustomerOrderEntryDialog(QDialog):
         self.paid_amount_input = QLineEdit("0.00")
         self.paid_amount_input.setObjectName("AmountPaidInput")
         self.paid_amount_input.setPlaceholderText("Enter amount")
+        self.payment_method_combo = QComboBox()
+        self.payment_method_combo.setObjectName("AmountPaidInput")
+        self.payment_method_combo.addItems(("Cash", "UPI", "Card", "Bank Transfer", "Other"))
         self.balance_amount_input = self._summary_value("0.00")
-        self._dialog_control(self.paid_amount_input)
+        self._dialog_control(self.paid_amount_input, self.payment_method_combo)
         summary_row.addWidget(self._summary_block("Bill Amount (INR)", self.bill_amount_input))
         summary_row.addWidget(self._summary_block("Amount Paid (INR)", self.paid_amount_input))
+        summary_row.addWidget(self._summary_block("Payment Mode", self.payment_method_combo))
         summary_row.addWidget(self._summary_block("Balance (INR)", self.balance_amount_input))
         items_header.addLayout(summary_row)
 
@@ -442,6 +835,7 @@ class CustomerOrderEntryDialog(QDialog):
             "weight": self._parse_weight(self.weight_input.text()),
             "bill_amount": self._bill_amount(),
             "paid_amount": self._parse_paid_amount(self.paid_amount_input.text()),
+            "payment_method": self.payment_method_combo.currentText().strip(),
             "items": items,
         }
 
@@ -623,6 +1017,7 @@ class CustomerOrderEntryDialog(QDialog):
         if bill_amount <= Decimal("0.00"):
             if self.paid_amount_input.isEnabled():
                 self.paid_amount_input.setEnabled(False)
+                self.payment_method_combo.setEnabled(False)
             if self.paid_amount_input.text() != "0.00":
                 self.paid_amount_input.blockSignals(True)
                 self.paid_amount_input.setText("0.00")
@@ -631,6 +1026,7 @@ class CustomerOrderEntryDialog(QDialog):
             return
         if not self.paid_amount_input.isEnabled():
             self.paid_amount_input.setEnabled(True)
+            self.payment_method_combo.setEnabled(True)
         try:
             paid_amount = self._parse_paid_amount(self.paid_amount_input.text())
         except ValueError:
@@ -897,7 +1293,8 @@ class CustomerOrderEntryDialog(QDialog):
             QLineEdit#SummaryReadonlyAmount:focus {
                 border: none;
             }
-            QLineEdit#AmountPaidInput {
+            QLineEdit#AmountPaidInput,
+            QComboBox#AmountPaidInput {
                 min-width: 118px;
                 min-height: 34px;
                 border: 1px solid #dfe3ec;
@@ -908,10 +1305,12 @@ class CustomerOrderEntryDialog(QDialog):
                 font-weight: 500;
                 padding: 0 10px;
             }
-            QLineEdit#AmountPaidInput:focus {
+            QLineEdit#AmountPaidInput:focus,
+            QComboBox#AmountPaidInput:focus {
                 border: 1px solid #4f46e5;
             }
-            QLineEdit#AmountPaidInput:disabled {
+            QLineEdit#AmountPaidInput:disabled,
+            QComboBox#AmountPaidInput:disabled {
                 background-color: #f8fafc;
                 color: #98a2b3;
             }
@@ -969,6 +1368,9 @@ class CustomerDetailsDialog(QDialog):
         measurement_rows: tuple[MeasurementRow, ...],
         operations_service: OperationsService,
         store_id: str,
+        store_name: str,
+        store_address: str,
+        store_contact: str,
         created_by_name: str,
         language_code: str = "en",
         parent: QWidget | None = None,
@@ -981,6 +1383,9 @@ class CustomerDetailsDialog(QDialog):
         self._measurement_rows = measurement_rows
         self._operations_service = operations_service
         self._store_id = store_id
+        self._store_name = store_name.strip() or "Store Name"
+        self._store_address = store_address.strip()
+        self._store_contact = store_contact.strip()
         self._created_by_name = created_by_name.strip() or "Current manager"
         self._order_summaries = self._build_order_summaries()
         self._selected_order_id = str(self._order_summaries[0]["order_id"]) if self._order_summaries else ""
@@ -1192,6 +1597,7 @@ class CustomerDetailsDialog(QDialog):
         self.new_order_button.clicked.connect(self._open_new_order_dialog)
         self.orders_table.cellClicked.connect(self._handle_order_row_clicked)
         self.mark_payment_button.clicked.connect(self._mark_payment)
+        self.print_receipt_button.clicked.connect(self._open_selected_order_receipt)
         self.payment_amount_input.textChanged.connect(lambda _value="": self._refresh_mark_payment_button_text())
         self.payment_notes_input.textChanged.connect(self._refresh_mark_payment_button_text)
         self.delivered_button.clicked.connect(self._mark_delivered)
@@ -1533,6 +1939,37 @@ class CustomerDetailsDialog(QDialog):
         self._set_payment_feedback("Payment recorded.", tone="success")
         self._reload_customer_detail_data()
 
+    def _open_selected_order_receipt(self) -> None:
+        log_ui_action(
+            self.__class__.__name__,
+            "print_receipt",
+            order_id=self._selected_order_id or "",
+            customer_id=self._customer.customer_id,
+        )
+        if not self._selected_order_id:
+            self._set_payment_feedback("Select an order before printing receipt.", tone="error")
+            return
+        self._open_receipt_dialog(order_id=self._selected_order_id)
+
+    def _open_receipt_dialog(self, *, order_id: str) -> None:
+        order = self._operations_service.get_order(order_id)
+        if order is None or order.customer_id != self._customer.customer_id:
+            self._set_payment_feedback("The selected order could not be found for this customer.", tone="error")
+            return
+        items = self._operations_service.list_order_items_for_order(order_id=order_id)
+        payments = tuple(row for row in self._payment_history if row.order_id == order_id)
+        OrderReceiptDialog(
+            store_name=self._store_name,
+            store_subtitle="",
+            store_address=self._store_address,
+            store_contact=self._store_contact,
+            customer=self._customer,
+            order=order,
+            items=items,
+            payment_history=payments,
+            parent=self,
+        ).exec()
+
     def _mark_delivered(self) -> None:
         log_ui_action(
             self.__class__.__name__,
@@ -1580,7 +2017,7 @@ class CustomerDetailsDialog(QDialog):
                 dialog.set_feedback("Add at least one order item before saving.", tone="error")
                 continue
             try:
-                self._operations_service.create_order_for_customer(
+                created_order_id = self._operations_service.create_order_for_customer(
                     store_id=self._store_id,
                     customer_id=self._customer.customer_id,
                     order=CustomerOrderCreateInput(
@@ -1590,6 +2027,7 @@ class CustomerDetailsDialog(QDialog):
                         priority=str(payload["priority"]),
                         status=str(payload["order_status"]),
                         paid_amount=payload["paid_amount"],  # type: ignore[arg-type]
+                        payment_method=str(payload["payment_method"]),
                         items=order_items,
                         weight=payload["weight"],  # type: ignore[arg-type]
                     ),
@@ -1599,7 +2037,10 @@ class CustomerDetailsDialog(QDialog):
                 continue
             self._set_payment_feedback("Order created.", tone="success")
             self._reload_customer_detail_data()
+            self._selected_order_id = created_order_id
+            self._refresh_latest_order_summary()
             self._show_detail_tab(0)
+            self._open_receipt_dialog(order_id=created_order_id)
             break
 
     def _default_order_title(self, items: tuple[OrderItemCreateInput, ...]) -> str:
@@ -2550,6 +2991,7 @@ class StoreManagerCustomerDashboardScreen(QWidget):
                 priority=str(payload["priority"]),
                 status=str(payload["order_status"]),
                 paid_amount=payload["paid_amount"],  # type: ignore[arg-type]
+                payment_method=str(payload["payment_method"]),
                 items=order_items,
                 weight=payload["weight"],  # type: ignore[arg-type]
             )
@@ -2560,7 +3002,7 @@ class StoreManagerCustomerDashboardScreen(QWidget):
                     item_count=len(order_items),
                     **self._log_context(),
                 )
-                self._operations_service.create_customer_with_orders(
+                created_customer_id = self._operations_service.create_customer_with_orders(
                     store_id=self._store_context.store_id,
                     full_name=str(payload["full_name"]),
                     mobile=str(payload["mobile"]),
@@ -2577,6 +3019,15 @@ class StoreManagerCustomerDashboardScreen(QWidget):
             self.refresh_data()
             self.search_input.setText(str(payload["full_name"]))
             self._apply_search()
+            created_orders = self._operations_service.list_orders_for_customer(
+                store_id=self._store_context.store_id,
+                customer_id=created_customer_id,
+            )
+            if created_orders:
+                self._open_receipt_dialog(
+                    customer_id=created_customer_id,
+                    order_id=created_orders[0].order_id,
+                )
             break
 
     def _open_customer_details_dialog(self, row: int, _column: int) -> None:
@@ -2617,6 +3068,9 @@ class StoreManagerCustomerDashboardScreen(QWidget):
             measurement_rows=measurement_rows,
             operations_service=self._operations_service,
             store_id=self._store_context.store_id,
+            store_name=self._store_context.store_name,
+            store_address=self._store_context.address,
+            store_contact=self._store_context.contact_info,
             created_by_name=self._user_management_service.display_name_for_user(self._current_user_id)
             if self._current_user_id is not None
             else "Current manager",
@@ -2624,6 +3078,38 @@ class StoreManagerCustomerDashboardScreen(QWidget):
             parent=self,
         ).exec()
         self.refresh_data()
+
+    def _open_receipt_dialog(self, *, customer_id: str, order_id: str) -> None:
+        if self._store_context is None:
+            return
+        customer = self._operations_service.get_customer_for_store(
+            store_id=self._store_context.store_id,
+            customer_id=customer_id,
+        )
+        order = self._operations_service.get_order(order_id)
+        if customer is None or order is None:
+            self._set_feedback("The saved order could not be loaded for receipt printing.", tone="error")
+            return
+        items = self._operations_service.list_order_items_for_order(order_id=order_id)
+        payment_history = tuple(
+            row
+            for row in self._operations_service.list_payment_history_for_store(
+                store_id=self._store_context.store_id,
+                customer_id=customer_id,
+            )
+            if row.order_id == order_id
+        )
+        OrderReceiptDialog(
+            store_name=self._store_context.store_name,
+            store_subtitle="",
+            store_address=self._store_context.address,
+            store_contact=self._store_context.contact_info,
+            customer=customer,
+            order=order,
+            items=items,
+            payment_history=payment_history,
+            parent=self,
+        ).exec()
 
     def _default_order_title(self, items: tuple[OrderItemCreateInput, ...]) -> str:
         if len(items) == 1:
